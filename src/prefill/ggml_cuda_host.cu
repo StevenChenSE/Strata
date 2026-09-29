@@ -3,6 +3,7 @@
 #include "common.cuh"
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <vector>
@@ -30,7 +31,22 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             cudaDeviceProp prop;
             CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
             auto & d = in.devices[id];
+#ifdef GGML_USE_HIP
+            // llama.cpp's own rule (ggml-cuda.cu): an AMD cc comes from gcnArchName, not major.minor -
+            // HIP reports gfx1100 as major 11 minor 0, and cc 110 would send the MMQ dispatch down the
+            // NVIDIA paths, whose RDNA3 device instantiations do not exist.
+            {
+                unsigned v = 0;
+                const char* g = prop.gcnArchName;
+                if (g && std::sscanf(g + (std::strncmp(g, "gfx", 3) == 0 ? 3 : 0), "%x", &v) == 1) {
+                    d.cc = GGML_CUDA_CC_OFFSET_AMD + (int) v;
+                } else {
+                    d.cc = GGML_CUDA_CC_OFFSET_AMD;
+                }
+            }
+#else
             d.cc = 100 * prop.major + 10 * prop.minor;
+#endif
             d.nsm = prop.multiProcessorCount;
             d.smpb = prop.sharedMemPerBlock;
             d.smpbo = prop.sharedMemPerBlockOptin;

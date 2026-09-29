@@ -423,7 +423,11 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+#ifdef STRATA_BACKEND_HIP
+    while (__hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < value) __nanosleep(100);
+#else
     while (*flag < value) __nanosleep(100);
+#endif
     __threadfence_system();
 }
 }  // namespace
@@ -471,8 +475,13 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     *skip = ring;
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
+#ifdef STRATA_BACKEND_HIP
+    if (__hip_atomic_load((const unsigned int*) skip, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == value) return;
+    while (__hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < value) __nanosleep(100);
+#else
     if (*skip == value) return;
     while (*flag < value) __nanosleep(100);
+#endif
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,

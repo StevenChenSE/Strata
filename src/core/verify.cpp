@@ -1005,7 +1005,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) { err = "verify: timed out at layer " + std::to_string(l); return false; }
+            if (now - a > std::chrono::seconds(20)) {
+                char db[160];
+                std::snprintf(db, sizeof db, " [seq=%u flag=%u flagA=%u flagB=%u want=%u]",
+                              *(volatile uint32_t*) h_seq_, *(volatile uint32_t*) h_flag_,
+                              *(volatile uint32_t*) h_flagA_, *(volatile uint32_t*) h_flagB_, want);
+                err = "verify: timed out at layer " + std::to_string(l) + db;
+                return false;
+            }
         }
         const Clock::time_point b = Clock::now();
         VDBG("layer %lld rang\n", (long long) l);

@@ -154,7 +154,14 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
+    // same per-layer ranges as open(): resetting to 0 makes EVERY layer's first experts collide in
+    // slots 0.. and the profile verify reads a slot that a later layer overwrote.
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
 }
 
@@ -261,6 +268,16 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
+    {   // HIP DEBUG: read the first 4 bytes back immediately; a synchronous copy must land
+        uint8_t back[4] = {0, 0, 0, 0};
+        const cudaError_t e2 = cudaMemcpy(back, dst, 4, cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "fill_slot_blocking: slot %d n %zu dst %p src %p copy %s readback %s"
+                             " %02x%02x%02x%02x (host %02x%02x%02x%02x)\n",
+                     slot, n, (const void*) dst, (const void*) host_blob,
+                     cudaGetErrorString(e), cudaGetErrorString(e2),
+                     back[0], back[1], back[2], back[3],
+                     host_blob[0], host_blob[1], host_blob[2], host_blob[3]);
+    }
     ++fills_;
     return true;
 }
@@ -310,10 +327,18 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     if (std::memcmp(got.data(), host_blob, (size_t) nb) != 0) {
         size_t first = 0;
         while (first < (size_t) nb && got[first] == host_blob[first]) ++first;
-        char buf[256];
+        hipPointerAttribute_t pa{};
+        const hipError_t pe = hipPointerGetAttributes(&pa, host_blob);
+        char buf[640];
         std::snprintf(buf, sizeof buf,
-                      "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
-                      (int) slot, (unsigned long long) first, (long long) blob_);
+                      "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)"
+                      " [dev %02x%02x%02x%02x host %02x%02x%02x%02x devptr %p hostptr %p n %lld"
+                      " hostptr-attrs: rc %s type %d dev %d devptr %p]",
+                      (int) slot, (unsigned long long) first, (long long) blob_,
+                      got[0], got[1], got[2], got[3],
+                      host_blob[0], host_blob[1], host_blob[2], host_blob[3],
+                      (const void*) src, (const void*) host_blob, (long long) nb,
+                      hipGetErrorName(pe), (int) pa.type, pa.device, (void*) pa.devicePointer);
         err = buf;
         return false;
     }
