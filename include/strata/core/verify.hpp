@@ -159,6 +159,7 @@ private:
     static constexpr int kProfPer = 32;              // stamps per layer
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
+    void* ymis_dev_ = nullptr;                            // HIP: device mirror of m_ymiss_
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;

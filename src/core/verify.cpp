@@ -51,6 +51,18 @@
 // HIP DEBUG bridge (defined in verify_kernels.cu)
 namespace strata::kernels { void wait_flag_debug_obs(unsigned int out[3]); }
 
+// HIP: the in-graph doorbell waits must be DRIVER wait nodes, not spinning kernels.  gfx1100's L2
+// caches mapped-host-memory reads and nothing invalidates those lines when the host rewrites the
+// page (measured: a kernel re-reading a rewritten word never observes the new value, while
+// hipStreamWaitValue32 sees it immediately) - so a kernel-level spin deadlocks.
+static void hip_wait_ge(cudaStream_t cs, const void* dev_flag, unsigned value) {
+    const hipError_t e = hipStreamWaitValue32(cs, (hipDeviceptr_t) dev_flag, value,
+                                              hipStreamWaitValueGte, 0xFFFFFFFFu);
+    if (e != hipSuccess) std::fprintf(stderr, "strata verify: hipStreamWaitValue32: %s\n", hipGetErrorString(e));
+}
+static bool hip_backend() { return true; }
+#define HIP_CK(x) do { const hipError_t e_ = (x); if (e_ != hipSuccess) std::fprintf(stderr, "strata verify: %s: %s\n", #x, hipGetErrorString(e_)); } while (0)
+
 namespace strata::core {
 namespace {
 
@@ -118,6 +130,9 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 Verifier::~Verifier() {
+#ifdef STRATA_BACKEND_HIP
+    if (ymis_dev_) { cudaFree(ymis_dev_); ymis_dev_ = nullptr; }
+#endif
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) cudaStreamSynchronize(cs_);
@@ -293,7 +308,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+#ifdef STRATA_BACKEND_HIP
+        device_plan_ = false;   // the _or waits have no driver form; the host always publishes
+#else
         device_plan_ = v != nullptr && std::atoi(v) != 0;
+#endif
     }
     if (device_plan_) {
         bool ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -304,6 +323,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); device_plan_ = false; }
     }
+#ifdef STRATA_BACKEND_HIP
+    {   // device mirror of the pool's mapped y_miss rows: the DMA copy is coherent, the mapped
+        // re-read is not (gfx1100 L2 caches host writes with no invalidation path)
+        if (cudaMalloc((void**) &ymis_dev_, (size_t) max_t * K * N * 4) != cudaSuccess) {
+            err = "verify: the y_miss device mirror allocation failed";
+            return false;
+        }
+    }
+#endif
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
     return true;
@@ -344,9 +372,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     groups_[T] = G;
 
     // ---- the window's inputs, from mapped staging
+#ifdef STRATA_BACKEND_HIP
+    HIP_CK(hipMemcpyAsync(tok_, m_tok_, (size_t) T * 4, hipMemcpyHostToDevice, cs));
+    HIP_CK(hipMemcpyAsync(step_, m_step_, (size_t) T * kStepCount * 4, hipMemcpyHostToDevice, cs));
+    HIP_CK(hipMemcpyAsync(pos_, m_pos_, (size_t) MT * (NH + NKV + IQ) * 4, hipMemcpyHostToDevice, cs));
+#else
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+#endif
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -657,11 +691,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
         if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
-            wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
+            hip_wait_ge(cs, m_flagA_, ring);   // HIP: no _or form; device_plan_ is forced off
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
-            wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
+            hip_wait_ge(cs, m_flagA_, ring);                   // the pool published this group's GPU plan
+#ifdef STRATA_BACKEND_HIP
+            // SDMA copies see the host's writes; a kernel re-read of mapped memory hits stale L2
+            HIP_CK(hipMemcpyAsync(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, (size_t) plan_i32_ * 4,
+                              hipMemcpyHostToDevice, cs));
+#else
             copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+#endif
         }
         stamp(l, 19, grp);
         const int32_t* p_counts = pl;
@@ -689,8 +729,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+        hip_wait_ge(cs, m_flagB_, ring);
+        // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
             uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -700,18 +740,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 21, grp);
         grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
-            wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
-            copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
-                                     skip_ + grp, ring, cs);
-        } else {
-            wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
+        {   // HIP: device_plan_ forced off
+            hip_wait_ge(cs, m_flag_, ring);                // the CPU's share is in the mapped rows
+#ifdef STRATA_BACKEND_HIP
+            HIP_CK(hipMemcpyAsync(ymis_dev_, m_ymiss_, (size_t) max_t_ * K * N * 4, hipMemcpyHostToDevice, cs));
+#endif
             stamp(l, 23, grp);
+#ifdef STRATA_BACKEND_HIP
+            // the rows were DMA'd into ymis_dev_ above; gather from the device copy (fresh)
+            const float* ysrc = (const float*) ymis_dev_ + (size_t) tb * K * N;
+#else
+            const float* ysrc = m_ymiss_ + (size_t) tb * K * N;
+#endif
             if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-                copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                copy_rows_from_mapped(parts_ + (size_t) tb * K * N, ysrc, (int64_t) n * K, N,
                                       p_dst, p_counts + 1, cs);
             else
-                copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+                copy_from_mapped(parts_ + (size_t) tb * K * N, ysrc, (int64_t) n * K * N, cs);
         }
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
