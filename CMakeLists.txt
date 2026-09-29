@@ -639,8 +639,14 @@ if(STRATA_ENABLE_HIP)
   # line of every TU: nvcc predefines __forceinline__/__ldg as builtins, HIP only gets them from
   # its headers, and some headers are included before <cuda_runtime.h>.
   include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/compat/hip)
-  add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-include${CMAKE_CURRENT_SOURCE_DIR}/compat/hip/cuda_runtime.h>)
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-include${CMAKE_CURRENT_SOURCE_DIR}/compat/hip/cuda_runtime.h>)
+  # The shim is force-included only on the HIP targets below (NOT on strata_mmq_hip: llama.cpp's
+  # vendors/hip.h defines its own shims and the two macro sets collide).
+
+  macro(strata_hip_shim TGT)
+    target_compile_options(${TGT} PRIVATE
+      $<$<COMPILE_LANGUAGE:HIP>:-include${CMAKE_CURRENT_SOURCE_DIR}/compat/hip/cuda_runtime.h>
+      $<$<COMPILE_LANGUAGE:CXX>:-include${CMAKE_CURRENT_SOURCE_DIR}/compat/hip/cuda_runtime.h>)
+  endmacro()
 
   add_library(strata_core_hip STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp
                                      src/core/graph.cpp src/core/weights.cpp src/core/layout.cpp)
@@ -648,6 +654,7 @@ if(STRATA_ENABLE_HIP)
   target_include_directories(strata_core_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_definitions(strata_core_hip PUBLIC $<$<COMPILE_LANGUAGE:HIP>:__CUDA_ARCH__=750>)
   target_link_libraries(strata_core_hip PUBLIC strata_plan strata_warnings hip::host)
+  strata_hip_shim(strata_core_hip)
 
   add_executable(strata-device-hip src/core/device_main.cpp)
   target_link_libraries(strata-device-hip PRIVATE strata_core_hip)
@@ -670,6 +677,7 @@ if(STRATA_ENABLE_HIP)
   option(STRATA_HIP_KERNEL_DEBUG "keep -g in HIP kernels" ON)
   set_property(TARGET strata_kernels_hip PROPERTY HIP_RESPECT_CONFIG 1)
   target_link_libraries(strata_kernels_hip PUBLIC strata_plan strata_warnings hip::host)
+  strata_hip_shim(strata_kernels_hip)
 
   # ---- engine, prefill, program: the full `strata` binary under HIP ----
   # Prefill uses STRATA_PREFILL_MMQ=0 (fp16 GEMM through hipBLAS) until strata_mmq's llama.cpp
@@ -690,6 +698,7 @@ if(STRATA_ENABLE_HIP)
   # real MMQ path arrives with strata_mmq built from llama.cpp's GGML_HIP sources (phase 2)
   find_package(hipblas CONFIG REQUIRED)
   target_link_libraries(strata_prefill_hip PUBLIC strata_engine_hip hip::host roc::hipblas)
+  strata_hip_shim(strata_prefill_hip)
 
   # ---- parity self-tests: the port's correctness gate (synthetic oracles, no model) ----
   foreach(_p dequant_s2 s2_gemv s2_gemv_q8 s_gemv s_gemv_q8k iq shared_expert gr gdn sampler rope
@@ -697,6 +706,7 @@ if(STRATA_ENABLE_HIP)
              qsa_prompt_attn native_expert)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/${_p}_parity.cpp)
       add_executable(${_p}_parity_hip src/kernels/${_p}_parity.cpp)
+      strata_hip_shim(${_p}_parity_hip)
       target_link_libraries(${_p}_parity_hip PRIVATE strata_kernels_hip strata_core_hip hip::host)
       if(_p STREQUAL "native_expert")
         # compares the GPU dequant against ggml-cpu's own dot products (the i-quant oracle)
@@ -706,4 +716,33 @@ if(STRATA_ENABLE_HIP)
       target_compile_definitions(${_p}_parity_hip PRIVATE $<$<COMPILE_LANGUAGE:HIP>:__CUDA_ARCH__=750>)
     endif()
   endforeach()
+endif()
+
+if(STRATA_ENABLE_HIP)
+  # ---- strata_mmq_hip: the prompt path's quantized expert GEMM (llama.cpp ggml-cuda, GGML_HIP build) ----
+  # Same files the CUDA target compiles with nvcc; under HIP they resolve through llama.cpp's own
+  # vendors/hip.h (GGML_USE_HIP).  Compiled WITHOUT the Strata shim force-include: the ggml headers
+  # define their own CUDA-spelling shims and mixing the two macro sets is not worth the fight.
+  set(STRATA_MMQ_GGML_DIR "" CACHE PATH "llama.cpp checkout for the MMQ sources (defaults to STRATA_GGML_DIR)")
+  if(NOT STRATA_MMQ_GGML_DIR)
+    set(STRATA_MMQ_GGML_DIR "${STRATA_GGML_DIR}")
+  endif()
+  if(STRATA_MMQ_GGML_DIR)
+    set(_mmq ${STRATA_MMQ_GGML_DIR}/ggml/src/ggml-cuda)
+    add_library(strata_mmq_hip STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_mmq}/quantize.cu)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs)
+      target_sources(strata_mmq_hip PRIVATE ${_mmq}/template-instances/mmq-instance-${_t}.cu)
+    endforeach()
+    set_source_files_properties(src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_mmq}/quantize.cu PROPERTIES LANGUAGE HIP)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs)
+      set_source_files_properties(${_mmq}/template-instances/mmq-instance-${_t}.cu PROPERTIES LANGUAGE HIP)
+    endforeach()
+    target_include_directories(strata_mmq_hip PRIVATE ${STRATA_MMQ_GGML_DIR}/ggml/include ${STRATA_MMQ_GGML_DIR}/ggml/src ${_mmq}
+                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(strata_mmq_hip PUBLIC STRATA_PREFILL_MMQ=1)
+    target_compile_definitions(strata_mmq_hip PRIVATE GGML_USE_HIP GGML_HIP_GRAPHS GGML_HIP_NO_VMM)
+    target_compile_options(strata_mmq_hip PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-U__HIP_NO_HALF_OPERATORS__ -U__HIP_NO_HALF_CONVERSIONS__>)
+    target_link_libraries(strata_mmq_hip PUBLIC ggml-base hip::host)
+    target_link_libraries(strata_prefill_hip PUBLIC strata_mmq_hip)
+  endif()
 endif()
