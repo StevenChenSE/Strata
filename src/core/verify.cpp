@@ -1011,6 +1011,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                               *(volatile uint32_t*) h_seq_, *(volatile uint32_t*) h_flag_,
                               *(volatile uint32_t*) h_flagA_, *(volatile uint32_t*) h_flagB_, want);
                 err = "verify: timed out at layer " + std::to_string(l) + db;
+                if (prof_on_) {   // HIP DEBUG: which stage's stamp is the last one the GPU reached?
+                    const size_t np = (size_t) g.n_layers * kProfPer + 4;
+                    std::vector<unsigned long long> p(np, 0);
+                    // a sync copy on the null stream would queue behind the spinning kernel
+                    static cudaStream_t diag = [] { cudaStream_t s = nullptr;
+                        cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking); return s; }();
+                    if (cudaMemcpyAsync(p.data(), prof_, np * 8, cudaMemcpyDeviceToHost, diag) == cudaSuccess
+                        && cudaStreamSynchronize(diag) == cudaSuccess) {
+                        err += " stamps:";
+                        unsigned long long prev = 0;
+                        for (size_t i = 0; i < np; ++i) {
+                            if (p[i] == 0) continue;
+                            err += " " + std::to_string(i) + ":" + std::to_string(p[i] - prev);
+                            prev = p[i];
+                        }
+                    }
+                }
                 return false;
             }
         }
