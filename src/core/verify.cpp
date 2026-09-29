@@ -48,6 +48,9 @@
 #include <exception>
 #include <immintrin.h>
 
+// HIP DEBUG bridge (defined in verify_kernels.cu)
+namespace strata::kernels { void wait_flag_debug_obs(unsigned int out[3]); }
+
 namespace strata::core {
 namespace {
 
@@ -1005,11 +1008,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
-                char db[160];
-                std::snprintf(db, sizeof db, " [seq=%u flag=%u flagA=%u flagB=%u want=%u]",
+            const int timeout_s = [] { const char* e = std::getenv("STRATA_VERIFY_TIMEOUT_S"); return e ? std::atoi(e) : 20; }();
+            if (timeout_s > 0 && now - a > std::chrono::seconds(timeout_s)) {
+                unsigned int obs[3] = {0, 0, 0};
+                strata::kernels::wait_flag_debug_obs(obs);
+                char db[220];
+                std::snprintf(db, sizeof db, " [seq=%u flag=%u flagA=%u flagB=%u want=%u wait: obs=%u val=%u spins64k=%u]",
                               *(volatile uint32_t*) h_seq_, *(volatile uint32_t*) h_flag_,
-                              *(volatile uint32_t*) h_flagA_, *(volatile uint32_t*) h_flagB_, want);
+                              *(volatile uint32_t*) h_flagA_, *(volatile uint32_t*) h_flagB_, want, obs[0], obs[1], obs[2]);
                 err = "verify: timed out at layer " + std::to_string(l) + db;
                 if (prof_on_) {   // HIP DEBUG: which stage's stamp is the last one the GPU reached?
                     const size_t np = (size_t) g.n_layers * kProfPer + 4;

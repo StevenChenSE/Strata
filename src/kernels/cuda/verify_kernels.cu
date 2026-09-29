@@ -421,10 +421,18 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     check("gdn_step_norm_multi");
 }
 
+__device__ unsigned int g_wait_obs[3] = {0, 0, 0};   // HIP DEBUG: [observed, value, spins>>16]
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
 #ifdef STRATA_BACKEND_HIP
-    while (__hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < value) __nanosleep(100);
+    unsigned n = 0;
+    for (;;) {
+        const unsigned int cur = __hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (cur >= value) break;
+        if ((++n & 0xFFFFu) == 0) { g_wait_obs[0] = cur; g_wait_obs[1] = value; g_wait_obs[2] = n >> 16; }
+        __nanosleep(100);
+    }
+    g_wait_obs[0] = 0xFFFFFFFFu; g_wait_obs[1] = value; g_wait_obs[2] = n;
 #else
     while (*flag < value) __nanosleep(100);
 #endif
@@ -477,7 +485,14 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
 #ifdef STRATA_BACKEND_HIP
     if (__hip_atomic_load((const unsigned int*) skip, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == value) return;
-    while (__hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < value) __nanosleep(100);
+    unsigned n = 0;
+    for (;;) {
+        const unsigned int cur = __hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (cur >= value) break;
+        if ((++n & 0xFFFFu) == 0) { g_wait_obs[0] = cur; g_wait_obs[1] = value; g_wait_obs[2] = 0x10000u | (n >> 16); }
+        __nanosleep(100);
+    }
+    g_wait_obs[0] = 0xFFFFFFFEu; g_wait_obs[1] = value; g_wait_obs[2] = 0x10000u | (n >> 16);
 #else
     if (*skip == value) return;
     while (*flag < value) __nanosleep(100);
@@ -564,6 +579,15 @@ namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
 } }
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
+}
+
+void wait_flag_debug_obs(unsigned int out[3]) {
+    // a sync copy would queue behind the very kernel that is spinning: use a non-blocking stream
+    static cudaStream_t diag = [] { cudaStream_t s = nullptr;
+        cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking); return s; }();
+    hipMemcpyFromSymbolAsync(out, HIP_SYMBOL(g_wait_obs), 3 * sizeof(unsigned int), 0,
+                             hipMemcpyDeviceToHost, diag);
+    hipStreamSynchronize(diag);
 }
 
 }  // namespace strata::kernels
