@@ -31,7 +31,56 @@ constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free 
 #endif
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
-#if !STRATA_PA_SM80
+#if !STRATA_PA_SM80 && defined(STRATA_BACKEND_HIP)
+    // gfx1100 has no mma.sync.  Fragment-preserving scalar emulation: keep every register in the
+    // PTX m16n8k16 f16 layout (the kernel's downstream indexing depends on it) and rebuild the
+    // full K range per lane with shuffles.  Lane L (gid = L>>2, tig = L&3) holds
+    //   A[gid][2tig,2tig+1] A[gid+8][2tig,2tig+1] A[gid][2tig+8,2tig+9] A[gid+8][2tig+8,2tig+9]
+    //   B[2tig,2tig+1][gid] B[2tig+8,2tig+9][gid]
+    // so the 4 lanes of quad gid hold all 16 K of rows gid/gid+8, and quad n holds all 16 K of
+    // B's column n.  Products accumulate in f32 like the tensor-core path.
+    const int lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tig = lane & 3;
+    auto h2f = [](uint32_t v, int half) {
+        return __half2float(__ushort_as_half((unsigned short) (v >> (16 * half))));
+    };
+    // B columns 2tig and 2tig+1, all 16 K each, gathered from quads 2tig / 2tig+1
+    float b0c[16], b1c[16];
+#pragma unroll
+    for (int tp = 0; tp < 4; ++tp) {
+        const int base = (2 * tig) * 4 + tp;
+        const uint32_t lo = __shfl_sync(0xffffffffu, b[0], base);
+        const uint32_t hi = __shfl_sync(0xffffffffu, b[1], base);
+        b0c[2 * tp] = h2f(lo, 0);        b0c[2 * tp + 1] = h2f(lo, 1);
+        b0c[2 * tp + 8] = h2f(hi, 0);    b0c[2 * tp + 9] = h2f(hi, 1);
+        const int base1 = (2 * tig + 1) * 4 + tp;
+        const uint32_t lo1 = __shfl_sync(0xffffffffu, b[0], base1);
+        const uint32_t hi1 = __shfl_sync(0xffffffffu, b[1], base1);
+        b1c[2 * tp] = h2f(lo1, 0);       b1c[2 * tp + 1] = h2f(lo1, 1);
+        b1c[2 * tp + 8] = h2f(hi1, 0);   b1c[2 * tp + 9] = h2f(hi1, 1);
+    }
+    float d0 = c[0], d1 = c[1], d2 = c[2], d3 = c[3];
+#pragma unroll
+    for (int tp = 0; tp < 4; ++tp) {
+        const int src = gid * 4 + tp;
+        // K = 2tp, 2tp+1 (a0/a1) and 2tp+8, 2tp+9 (a2/a3) for rows gid (a0/a2) and gid+8 (a1/a3)
+        const uint32_t a0 = __shfl_sync(0xffffffffu, a[0], src);
+        const uint32_t a1 = __shfl_sync(0xffffffffu, a[1], src);
+        const uint32_t a2 = __shfl_sync(0xffffffffu, a[2], src);
+        const uint32_t a3 = __shfl_sync(0xffffffffu, a[3], src);
+        const float r0[4] = {h2f(a0, 0), h2f(a0, 1), h2f(a2, 0), h2f(a2, 1)};
+        const float r1[4] = {h2f(a1, 0), h2f(a1, 1), h2f(a3, 0), h2f(a3, 1)};
+        const int k[4] = {2 * tp, 2 * tp + 1, 2 * tp + 8, 2 * tp + 9};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            d0 = fmaf(r0[j], b0c[k[j]], d0);
+            d1 = fmaf(r0[j], b1c[k[j]], d1);
+            d2 = fmaf(r1[j], b0c[k[j]], d2);
+            d3 = fmaf(r1[j], b1c[k[j]], d3);
+        }
+    }
+    c[0] = d0; c[1] = d1; c[2] = d2; c[3] = d3;
+#elif !STRATA_PA_SM80
     __trap();
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
@@ -655,12 +704,14 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         return false;
     cudaStream_t st = (cudaStream_t) stream;
 #if defined(STRATA_BACKEND_HIP)
-    // The HIP build compiles both MMA paths to traps (the __CUDA_ARCH__ guard at the top), and the
-    // inner product is tensor-core shaped all the way down - there is no MMA-free variant to route
-    // to.  Behave like the sm_75 build (batch refuses) so callers take the non-batched fallback
-    // until the v_wmma rewrite of this kernel lands.
-    (void) st;
-    return false;
+    // launch_i8's cp.async pipeline compiles to traps under HIP; the first-version kernel serves
+    // the same pool shapes through the emulated mma16816 above.  Same dispatch contract as CUDA.
+    if (pools.k_q != nullptr) {
+        if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
+        return launch<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
+    }
+    if (!pools.k_pool || !pools.v_pool) return false;
+    return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 #endif
     if (pools.k_q != nullptr) {
         if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
