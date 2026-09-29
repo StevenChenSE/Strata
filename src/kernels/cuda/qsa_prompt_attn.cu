@@ -654,6 +654,14 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
+#if defined(STRATA_BACKEND_HIP)
+    // The HIP build compiles both MMA paths to traps (the __CUDA_ARCH__ guard at the top), and the
+    // inner product is tensor-core shaped all the way down - there is no MMA-free variant to route
+    // to.  Behave like the sm_75 build (batch refuses) so callers take the non-batched fallback
+    // until the v_wmma rewrite of this kernel lands.
+    (void) st;
+    return false;
+#endif
     if (pools.k_q != nullptr) {
         if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
         // STRATA_PROMPT_ATTN_V1=1 (debug): the first version, same accuracy, another summation order - the control

@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -616,4 +616,94 @@ if(STRATA_BUILD_TESTS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
     add_subdirectory(tests)
   endif()
+endif()
+
+# ---- ROCm/HIP port (gfx1100) — experimental, single GPU --------------------
+# Mirrors STRATA_ENABLE_CUDA.  The CUDA sources are reused verbatim: the compat shim in
+# compat/hip/ supplies the CUDA spellings (see the header for what is a rename and what is a
+# semantic replacement), and __CUDA_ARCH__=750 steers the three __CUDA_ARCH__-guarded sites to
+# their portable fallback kernels (fp32 attention scorer, cp.async-free prompt attention).
+option(STRATA_ENABLE_HIP "Build the ROCm/HIP targets (experimental, gfx1100)" OFF)
+if(STRATA_ENABLE_HIP)
+  enable_language(HIP)
+  list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
+  find_package(hip CONFIG REQUIRED)   # hip::host: include path + libamdhip64 for the CXX TUs too
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
+    set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "HIP architectures" FORCE)
+  else()
+    set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "HIP architectures" FORCE)  # CMake defaults to the build host's arch (gfx1036 here); the port targets gfx1100 explicitly
+  endif()
+  # the CUDA-language sources keep their .cu extension under the HIP compiler
+  set(CMAKE_HIP_SOURCE_FILE_EXTENSIONS "hip;cu" CACHE STRING "HIP source extensions" FORCE)
+  # compat headers must win over any system CUDA headers, and must be present from the first
+  # line of every TU: nvcc predefines __forceinline__/__ldg as builtins, HIP only gets them from
+  # its headers, and some headers are included before <cuda_runtime.h>.
+  include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/compat/hip)
+  add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-include${CMAKE_CURRENT_SOURCE_DIR}/compat/hip/cuda_runtime.h>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-include${CMAKE_CURRENT_SOURCE_DIR}/compat/hip/cuda_runtime.h>)
+
+  add_library(strata_core_hip STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp
+                                     src/core/graph.cpp src/core/weights.cpp src/core/layout.cpp)
+  set_source_files_properties(src/core/device.cu src/core/pinned.cu PROPERTIES LANGUAGE HIP)
+  target_include_directories(strata_core_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(strata_core_hip PUBLIC $<$<COMPILE_LANGUAGE:HIP>:__CUDA_ARCH__=750>)
+  target_link_libraries(strata_core_hip PUBLIC strata_plan strata_warnings hip::host)
+
+  add_executable(strata-device-hip src/core/device_main.cpp)
+  target_link_libraries(strata-device-hip PRIVATE strata_core_hip)
+
+  # The kernel library: same sources as strata_kernels, under the HIP compiler.
+  file(GLOB _strata_hip_kernels CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/*.cu)
+  # ngram.cpp is host-only but lives in strata_kernels there for the same reason (shared ple geometry)
+  list(APPEND _strata_hip_kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ngram.cpp
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/src/ngram/ple_reader.cpp
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/direct_file.cpp)
+  add_library(strata_kernels_hip STATIC ${_strata_hip_kernels})
+  set_source_files_properties(${_strata_hip_kernels} PROPERTIES LANGUAGE HIP)
+  target_include_directories(strata_kernels_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_include_directories(strata_kernels_hip PRIVATE third_party/ggml)   # i-quant block layouts (ggml-common.h), same as strata_kernels
+  # HIP-language-only: leaking __CUDA_ARCH__ into CXX TUs makes ROCm headers auto-enable
+  # __HIP_DEVICE_COMPILE__ there (hip_common.h:36-38), which misconfigures the shim.
+  target_compile_definitions(strata_kernels_hip PRIVATE $<$<COMPILE_LANGUAGE:HIP>:__CUDA_ARCH__=750>)
+  # sglang's lesson: HIP gates half2 operators/conversions behind these opt-outs
+  target_compile_options(strata_kernels_hip PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-U__HIP_NO_HALF_OPERATORS__ -U__HIP_NO_HALF_CONVERSIONS__ -g>)
+  option(STRATA_HIP_KERNEL_DEBUG "keep -g in HIP kernels" ON)
+  set_property(TARGET strata_kernels_hip PROPERTY HIP_RESPECT_CONFIG 1)
+  target_link_libraries(strata_kernels_hip PUBLIC strata_plan strata_warnings hip::host)
+
+  # ---- engine, prefill, program: the full `strata` binary under HIP ----
+  # Prefill uses STRATA_PREFILL_MMQ=0 (fp16 GEMM through hipBLAS) until strata_mmq's llama.cpp
+  # MMQ sources are built with GGML_HIP; the CPU expert library is vendor-neutral and shared.
+  add_executable(strata-hip src/program/generate.cpp)
+  target_link_libraries(strata-hip PRIVATE strata_engine_hip strata_prefill_hip strata_spec hip::host)
+
+  add_library(strata_engine_hip STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
+    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp
+    src/core/verify.cpp src/core/mtp.cpp)
+  target_include_directories(strata_engine_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata_engine_hip PUBLIC strata_core_hip strata_kernels_hip strata_kernels_cpu hip::host)
+
+  add_library(strata_prefill_hip STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  set_source_files_properties(src/prefill/gemm.cu src/prefill/kernels.cu PROPERTIES LANGUAGE HIP)
+  target_include_directories(strata_prefill_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  # leaving STRATA_PREFILL_MMQ undefined compiles prefill.cpp's built()-false stub set; the
+  # real MMQ path arrives with strata_mmq built from llama.cpp's GGML_HIP sources (phase 2)
+  find_package(hipblas CONFIG REQUIRED)
+  target_link_libraries(strata_prefill_hip PUBLIC strata_engine_hip hip::host roc::hipblas)
+
+  # ---- parity self-tests: the port's correctness gate (synthetic oracles, no model) ----
+  foreach(_p dequant_s2 s2_gemv s2_gemv_q8 s_gemv s_gemv_q8k iq shared_expert gr gdn sampler rope
+             quantize_act router_top10 elementwise bf16_gemv kv_q8 kv_stream kv_q4 cvec qsa
+             qsa_prompt_attn native_expert)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/${_p}_parity.cpp)
+      add_executable(${_p}_parity_hip src/kernels/${_p}_parity.cpp)
+      target_link_libraries(${_p}_parity_hip PRIVATE strata_kernels_hip strata_core_hip hip::host)
+      if(_p STREQUAL "native_expert")
+        # compares the GPU dequant against ggml-cpu's own dot products (the i-quant oracle)
+        target_include_directories(${_p}_parity_hip PRIVATE third_party/ggml)
+        target_link_libraries(${_p}_parity_hip PRIVATE strata_kernels_cpu strata_artifact)
+      endif()
+      target_compile_definitions(${_p}_parity_hip PRIVATE $<$<COMPILE_LANGUAGE:HIP>:__CUDA_ARCH__=750>)
+    endif()
+  endforeach()
 endif()

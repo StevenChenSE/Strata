@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)  // hipcc spells the dual-pass marker __HIPCC__
 #define STRATA_ROPE_HD __host__ __device__
 #else
 #define STRATA_ROPE_HD
