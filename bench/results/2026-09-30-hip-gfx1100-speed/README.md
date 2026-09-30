@@ -1523,3 +1523,32 @@ Two process notes, both mine:
   command-line surface.
 * The default flip I was about to make was **wrong**, and the call-site comment is what stopped it.  Reading the
   comment above a line before changing that line is cheap; shipping a hang is not.
+
+## Round 37: the decode is volume-bound, not lockstep-bound - a hypothesis refuted by a fit, which closes the decode thread
+
+The previous entry left "overlap the host pool with the device compute" as the lever, on the observation that
+both sides wait per layer (the host's `ms_wait` is 36.5 ms/round = 760 us/layer; the GPU's doorbell waits are
+39.1 ms/round = 815 us/layer - a ping-pong).  A fixed per-layer handshake would show up as a large positive
+constant in the window scaling.  Fitting the four measured points:
+
+    round = 17.9 ms x window - 20.7 ms        (windows 4, 5, 6, 8 -> 52.0, 68.0, 85.7, 123.2 ms)
+
+**The intercept is negative**, so there is no fixed per-layer cost to remove: the round is *volume-driven*, and
+the per-slot cost rises with the window (13.0 -> 15.4 ms) because a wider window routes more distinct experts
+and therefore moves more bytes.  The lockstep is real but it is not the bottleneck, and its cost scales with the
+same volume.
+
+So the decode is at a principled local optimum: cost = volume, the window optimum (`--spec 3-4`) is the balance
+point between tokens/round and bytes/round, and the levers that remain are the same memory-hierarchy ones the
+prefill hit - the PCIe 4.0 x8 link (the DMA alternative is faster but hits issue #31's host hang) and the CPU
+expert pool, which runs at the machine's memory bandwidth with every physical core in use.
+
+**Caveat on the counterpart numbers.**  The CUDA-side figures in this file (50.5 tok/s at 1K, 49.0 at 32K) come
+from earlier rounds and I have not re-verified their exact configuration in this session.  The 1K comparison is
+the one I have re-measured repeatedly on my side (49.47 tok/s, 256 tokens); the 32K ratio (37.87 vs 49.0) should
+be treated as indicative until both sides are re-run with identical options.
+
+**What is still unattributed and still worth attacking:** the prefill's copy-engine *gaps* - 54 discrete ~26 ms
+stalls at 4K (1,413 ms of 5,412 ms, 26 %), which the mechanical explanations (ring depth, VRAM contention,
+scattered reads, rotating slots, adaptive tier, GPU sharing, CPU frequency, host chunk-setup) have all failed to
+explain.  That is ~24 % of the 4K prefill and the last unexplained item in the model.
