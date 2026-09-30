@@ -246,3 +246,42 @@ unchanged.  What the merge certainly brings is a large prefill win (+4 to +18 %,
 one reservation is *consistency*, not speed - the pre-merge binary's decode is tighter (47.4-48.4 against
 43.6-48.0), which matters for latency-sensitive serving and is the thread to pull if the merged build becomes the
 default.  The worktree branch `rebase-test` (`dd51c89`) is where it lives.
+
+## Does the merged build consistently beat upstream master?  No - it is a lean, not an advantage
+
+Adoption question asked directly: if the merge is taken, is it reliably better than simply using upstream's own
+master?  Measured interleaved with the order **alternating** per repetition (merged, master / master, merged /
+merged, master), each arm on its own documented configuration, 128 decoded tokens:
+
+| prompt | arm | pp median (range) | tg median (range) |
+| --- | --- | ---: | ---: |
+| 1K | merged | 487.7 (353-555) | 44.0 (41.5-46.6) |
+| 1K | master | 472.5 (468-474) | 44.3 (44.1-45.5) |
+| 4K | merged | 783.5 (768-1087) | 46.7 (41.2-57.5) |
+| 4K | master | 715.9 (669-751) | 42.4 (41.6-44.0) |
+
+Per-pair winners: merged takes prefill **2/3 pairs at 1K and 3/3 at 4K** (+3.2 % and +9.4 % on the medians) and
+decode **1/3 and 2/3** (-0.7 % and +10.2 %).  So prefill leans merged, decode is a coin flip, and neither is a
+sweep.
+
+Two caveats decide how much to read into it:
+
+* **These absolute numbers are far below the earlier session** (merged 4K 783.5 here against 971.6 then; master
+  715.9 against 758).  The box was in a slow phase for this run, which compresses the deltas and inflates the
+  noise - so the practical statement is that the *difference* is small and partly inside the measurement floor.
+* **The noise attaches to different arms in different sessions**, which means it is environmental rather than
+  build-specific: in the earlier gate it was the pre-merge binary that had the wide 4K range (704-918 against
+  merged's tight 952-975), and here it is merged that is wide (768-1087 against master's tight 669-751).  No
+  build is intrinsically the noisy one by this evidence.
+
+**This revises the earlier recommendation.**  The "+22-27 % prefill / +10-18 % decode" against master was measured
+without alternating the order and is likely optimistic; with alternating order the merged build's edge over master
+is +3 to +9 % on prefill and parity on decode, both partly inside the noise.  A three-way comparison
+(ours / master / merged) with rotated order and at least five reps per tier is what an adoption decision needs,
+and it has not been run.
+
+What *is* consistent, because it is deterministic and not a timing measurement: the merged build's MTP prompt cost
+is 11.8 ms against 155.1 ms, its drafting is 0.875 against 1.758 ms/round, its expert cache is 46 slots smaller
+(upstream's deliberate draft-head reservation), and it carries upstream's six releases of engine work - the k8v4
+KV option, the hipBLASLt path (inert on this ROCm), the setup/server changes and their HIP test suite.  Those are
+categorical gains; the throughput edge over master is not yet one.
