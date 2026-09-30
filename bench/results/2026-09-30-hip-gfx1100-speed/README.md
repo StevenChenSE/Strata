@@ -113,3 +113,65 @@ Per round, wall ≈ `wait for rings + pool + commit` (the three terms sum to the
    profiler was found; the verify window's `STRATA_VERIFY_PROFILE` does not cover it).
 5. Speculation: real-text acceptance (needs a tokenizer; `tools/strata_tokenizer.py` needs the `regex`
    module, which is not installed and `pip` is unavailable) or MTP weights (not authorised).
+
+## Round 2 of the perf investigation: pp phase attribution, the prefill ring, and the PLE
+
+### pp phase breakdown (`STRATA_PREFILL_TIMING=1`, 1,023 tokens, one chunk, best config)
+
+```
+GPU timeline 2428 ms, wall 2429 ms, host staging 21 ms:
+  gather         632 (17.5%)   <- staging the expert blobs
+  wait copy      574 (15.9%)   <- the GPU *idle*, waiting on an expert DMA event
+  embed+steps    502 (13.9%)
+  gdn            554 (15.4%)
+  hc read        284 ( 7.9%)
+  dequant+gemm   623 (17.3%)   <- dequant 250, gemm gate/up 229, gemm down 144
+  qsa proj+attn  345 ( 9.6%)   <- the emulated mma16816 prompt attention is NOT dominant
+  router+shared+combine+grouping  87 ( 2.4%)
+```
+
+So a third of the prompt is expert *staging*, and **574 ms of it is the GPU idling on copy events**.
+The emulated prompt attention, which PORT-STATUS flagged as the prefill suspect, is only ~10 %.
+
+### The staging ring is already tuned (`STRATA_PREFILL_RING`)
+
+The ring depth is chosen by the pinned-memory share (384 slots when ~all experts are DMA'd from pinned
+RAM, else 96) and can be overridden by env.  Measured sweep on this box (all with a warm PLE, 6,947
+experts streamed):
+
+| ring | 96 | 192 | 384 | 512 |
+| --- | ---: | ---: | ---: | ---: |
+| pp tok/s | 390.0 | 379.3 | **421.2** | 394.4 |
+
+384 is both the default and the optimum, so there is nothing to win there; the ~574 ms of exposed copy
+wait would need deeper *issue* lead (or per-layer prefetch) rather than a bigger ring.
+
+### The PLE table: does it need to be in RAM? **No — measured.**
+
+The table is ~25 GiB inside the 27.5 GiB second shard.  The default `--ple-io direct` is documented as
+*"unbuffered SSD reads, the table never enters RAM or the file cache"*; `--ple-io mmap` is the A/B arm.
+
+| PLE configuration | PLE gather (1,023 tokens) | pp |
+| --- | ---: | ---: |
+| `direct` (default) | **157 ms** | 402 tok/s |
+| `--ple-io mmap`, table fully in page cache (`buff/cache` 38 -> 64 GB after `cat`) | **2,300 ms** | 217 tok/s |
+| `direct` + `--ple-inflight 256` | 164 ms | 391 tok/s |
+| `direct` + `--ple-row-cache 8388608` (90 MB -> 720 MB) | 163 ms | 400 tok/s |
+
+* Warming the table into RAM changes **nothing** for the default mode (157 vs 161 ms) — it is unbuffered
+  by design, so the page cache is never consulted.
+* The RAM-resident `mmap` arm is **15x slower** than the unbuffered reader (its own comment in
+  `ngram.cpp` says "SIXTEEN SERIAL PAGE FAULTS, MEASURED" per token).
+* The two direct-mode tuning knobs do not move it either, so ~157 ms is that reader's floor here.
+* Practical conclusion: **do not load the PLE into RAM.**  It would also compete with the 46.84 GiB
+  *pinned, unevictable* expert arena on a 92 GiB box.  If the 6 % ever matters, the levers are a smaller
+  table or batching the row reads by address, not residency.
+
+### Measurement hygiene: pp has ~10 % run-to-run spread
+
+Two runs with the *same* configuration (cache 8192, `--prefill 2048`, `--max-new 256`, ring 384) gave
+2,633 ms and 2,950 ms of prefill.  One contributor is measurable — the PLE chunk-setup phase swung
+157 -> 491 ms between runs — the rest is unexplained.  **Compare pp only across runs that repeat the
+configuration, and report a spread rather than a single number.**  Best observed pp at 1K is
+**~400-420 tok/s** (ring 384, warm PLE, `--max-new 8`), i.e. at parity with the CUDA counterpart's 419
+on real prompts; the conservative same-protocol number (256 generated) is ~347-390.
