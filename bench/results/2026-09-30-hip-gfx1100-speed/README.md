@@ -890,3 +890,19 @@ So `wmma_gemm.cu` was the only site where a compiler macro could disagree with t
 stub.  The general rule this yields: **gate architecture-specific code on a macro the BUILD defines (or on
 `__HIPCC__`, which this toolchain sets in both passes), never on `__gfx1100__`, and always keep a
 false-returning fallback rather than empty kernels.**
+
+### Scoping note: the "hc read" phase IS the bf16 GEMM target
+
+The phase table's `hc read` is 10.5 % of the 1K prefill and 11.9 % at 4K - stable across tiers, which is why it
+looked like host work.  It is not: prefill.cpp:1073-1079 marks it and then runs, per *half* and so twice per
+layer:
+
+    gr_norm(R, hc_*_norm, xn, xn16)          -> bf16_proj(hc_*_down,   xn16 -> lo)
+    gr_silu(lo, lo16)                        -> bf16_proj(hc_*_up,     lo16 -> gated)
+                                             -> bf16_proj(hc_*_inject, xn16 -> inj)
+    gr_mix(xn, gated, mixed, mixed_bf)
+
+i.e. **six bf16 GEMMs per layer** (three per half) plus three small elementwise kernels.  That is exactly the
+`Gemm::bf16` path the BF16 WMMA variant targets, so the expected gain from that work is the GEMM share of this
+phase - with the bf16 GEMMs measured at 204 ms of the 731 ms of rocBLAS time in a 1K prefill (28 %), a 2x
+faster kernel should be worth roughly 4-6 % of prompt throughput.
