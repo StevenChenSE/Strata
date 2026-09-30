@@ -712,3 +712,28 @@ spends the *same share* of its time (32767/1499 = 21.9 s total, 516 GB at ~40 GB
 
 Also worth recording at 32K: MTP drafting costs 4.61 ms/round (925 MiB of VRAM), admission acceptance stays
 high (0.860, 3.79 tokens/round), and `--adapt-every 2` costs only 0.154 ms/round of host swapping.
+
+## Reference: the sibling project already solved this on the same GPU
+
+`../vllm-serving` (same box, gfx1100, same model family) has hand-written RDNA3 kernels worth copying
+from, and its notes reach the same conclusions this benchmark did:
+
+* `vllm/csrc/rocm/q_gemm_rdna3_wmma.cu` (2,106 lines) is a fused **W4A16 GPTQ WMMA prefill GEMM** with tile
+  variants `gemm_q4_wmma_kernel_{16x16_1w, 32x16_2w, 64x16_4w, 64x32_4w}`: the weight tile is dequantized
+  into `__shared__ T b_lds[...]`, accumulated with
+  `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` (16x16x16 per instruction on wave32, FP32 accumulate), with a
+  K-split epilogue for large K.  Small M (decode) deliberately stays in the sibling scalar/dot kernel
+  `q_gemm_rdna3.cu`.  **WMMA is therefore viable for this GPU's prefill shapes** - which is exactly what
+  rocBLAS is not doing for the engine's dense projections (measured 14 TFLOPS, see Round 13).
+* Documented traps to respect: wave32 WMMA input fragments are "doubled" (lanes 16..31 mirror 0..15) and the
+  C fragment mapping differs (lane t holds output column n = lane_lo, 8 elements alternating M rows by
+  lane_hi); and putting WMMA in the same translation unit as the scalar kernel **silently miscompiled the
+  M=1 path** - they isolate the TUs on purpose.
+* Their own bottleneck note matches this benchmark's: "`hipMemcpyAsync` 13.8 < Triton gather 14.4 GB/s ...
+  only two paths remain: reduce bytes (hot-cache hit rate; VRAM is full) or overlap the copies with compute
+  (the copy engine is idle during the GEMM)".  That is the same 58%-of-the-32K-prefill finding here, and the
+  same two levers: fewer re-streamed bytes, or a busier copy engine during compute.
+
+Delegated next: replace the HIP side of `Gemm::f16` (gemm.cu, currently `cublasGemmEx`/rocBLAS at 14 TFLOPS)
+with a WMMA GEMM modelled on that reference, keeping the existing `dequant_f16` staging and verifying both
+numerics against rocBLAS and throughput at the engine's own shapes.
