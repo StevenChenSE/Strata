@@ -238,6 +238,7 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 // in its own kernel. Per column the same arithmetic in the same order (the 4 row-group partial sums added as
 // red[0] + red[1] + red[2] + red[3]; the norm's warp sums over the same 32-column warps): the same bits.
 constexpr int CB = 32, NCB = S / CB;
+template <bool PREFETCH = true>
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                 const float* __restrict__ gate,
                                                                 const float* __restrict__ beta,
@@ -251,29 +252,81 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict
     const size_t rs = (size_t) HV * S;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-    for (int64_t t = 0; t < T; ++t) {
-        const float* ht = h + t * C;
-        __syncthreads();
-        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
-        __syncthreads();
-        const float g = __expf(gate[t * HV + head]);
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][c] = kv;
-        __syncthreads();
-        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
-        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
-        float o = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
+
+    if constexpr (PREFETCH) {
+        float cur_sq = 0.0f, cur_sk = 0.0f, cur_gate = 0.0f, cur_beta = 0.0f;
+        if (T > 0) {
+            if (tid < S) {
+                cur_sq = h[qh * S + tid];
+                cur_sk = h[HK * S + qh * S + tid];
+            }
+            cur_gate = gate[head];
+            cur_beta = beta[head];
         }
-        __syncthreads();
-        red[rg][c] = o;
-        __syncthreads();
-        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+        for (int64_t t = 0; t < T; ++t) {
+            float next_sq = 0.0f, next_sk = 0.0f, next_gate = 0.0f, next_beta = 0.0f;
+            if (t + 1 < T) {
+                const float* ht1 = h + (t + 1) * C;
+                if (tid < S) {
+                    next_sq = ht1[qh * S + tid];
+                    next_sk = ht1[HK * S + qh * S + tid];
+                }
+                next_gate = gate[(t + 1) * HV + head];
+                next_beta = beta[(t + 1) * HV + head];
+            }
+            const float* ht = h + t * C;
+            __syncthreads();
+            if (tid < S) { sq[tid] = cur_sq; sk[tid] = cur_sk; }
+            __syncthreads();
+            const float g = __expf(cur_gate);
+            float kv = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+            red[rg][c] = kv;
+            __syncthreads();
+            const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+            const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * cur_beta;
+            float o = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+                o = fmaf(s[r], sq[rg * RPG + r], o);
+            }
+            __syncthreads();
+            red[rg][c] = o;
+            __syncthreads();
+            if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+
+            cur_sq = next_sq;
+            cur_sk = next_sk;
+            cur_gate = next_gate;
+            cur_beta = next_beta;
+        }
+    } else {
+        for (int64_t t = 0; t < T; ++t) {
+            const float* ht = h + t * C;
+            __syncthreads();
+            if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
+            __syncthreads();
+            const float g = __expf(gate[t * HV + head]);
+            float kv = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+            red[rg][c] = kv;
+            __syncthreads();
+            const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+            const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
+            float o = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+                o = fmaf(s[r], sq[rg * RPG + r], o);
+            }
+            __syncthreads();
+            red[rg][c] = o;
+            __syncthreads();
+            if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+        }
     }
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
@@ -555,10 +608,18 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+    static const bool prefetch = [] {
+        const char* e = std::getenv("STRATA_GDN_REC_PREFETCH");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
     if (serial || T <= 0) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     } else {
-        gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        if (prefetch) {
+            gdn_rec_cols_kernel<true><<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        } else {
+            gdn_rec_cols_kernel<false><<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        }
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
     }
     check("gdn_recurrence");

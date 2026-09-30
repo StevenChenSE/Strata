@@ -1620,3 +1620,46 @@ appetite):
 | GDN recurrence | 1,732 ms = **3.7 %** at 32K | 192 blocks x 128 threads = 24k lanes on a GPU with ~196k: a serial scan using ~12 % of the machine, so a bounded kernel project with a clean target |
 | PCIe expert transfer (decode) | 24 ms/round = 28 % | link-bound; the DMA alternative hits issue #31 |
 | CPU expert pool | 33.6-60.6 ms/round | at the machine's memory bandwidth with every physical core in use |
+
+## GDN recurrence prefetch: works, but my prediction was 10x too optimistic - and dequant+WMMA for the experts is refuted
+
+**GDN recurrence prefetch (`workflow-21`, kept).**  `gdn_rec_cols_kernel` is now a template with a pipelined
+schedule that issues the next token's loads (the `h` rows, `gate` and `beta`) into registers before the current
+token's barriers, with the baseline preserved verbatim as `<false>` behind `STRATA_GDN_REC_PREFETCH=0`.  The
+arithmetic, shared-write order and barrier placement are unchanged, and the 8-token seed confirms it: with the
+default (WMMA) attention the output is bit-identical to what it was before this change, and with
+`STRATA_PA_WMMA=0` it still reproduces the reference token for token.
+
+Measured `gdn rec` phase:
+
+| tier | prefetch on | prefetch off | gain |
+| --- | ---: | ---: | ---: |
+| 4K | 198 ms | 202 ms | -2 % |
+| 32K | **1,580 ms** | 1,694 ms | **-6.7 %** |
+
+That is **0.25 % of the prefill**, not the 2-3x I predicted from the chain analysis.  The derivation was wrong:
+those three loads were not what the serial chain spends its ~1.19 us/token on.  A GDN phase breakdown at 4K
+shows where the phase actually sits - `gdn_rec_cols_kernel` 175.1 ms of 234.9 ms (72 launches, 2.43 ms each),
+`gdn_out_norm_kernel` 38.5 ms, `gdn_conv_tiled` 13.6 ms and the rest under 5 ms - so the rec kernel is 88 % of
+the phase and the prefetch moved a small part of it.  Kept because it is a real, numerics-preserving
+improvement with a clean A/B, but recorded at its true size.
+
+**Refuted: dequant-to-fp16 + WMMA for the *experts*.**  `STRATA_PREFILL_MMQ=0` routes the experts through the
+dequantise-then-`gemm.f16` path, which now uses the WMMA GEMM this session added - i.e. the same trick that won
+for the dense projections:
+
+| config | 4K prefill | gemm gate/up | gemm down |
+| --- | ---: | ---: | ---: |
+| MMQ (default) | **5,989-6,019 ms (680-684 tok/s)** | 784-803 ms | 383-410 ms |
+| `STRATA_PREFILL_MMQ=0` | 8,379-9,157 ms (447-489) | 3,231-3,714 ms | 1,699-2,064 ms |
+
+**~41 % slower**, with the GEMM phases 4-5x larger - a structural signature, not contention.  The reason is the
+one difference between the dense projections and the experts: the dense weights are dequantised once per chunk
+and reused across all T tokens (a 1:T reuse ratio, which is why WMMA wins there), whereas each expert block is
+streamed and used ~once, so expanding it to fp16 multiplies the bytes it must move by ~3.5x and the GEMM becomes
+bandwidth-bound.  The quantised dp4a path is the right one for streamed experts.
+
+**A measurement trap worth recording:** my in-loop "build started" guard used `pgrep -af clang`, which matches
+its own wrapper because the wrapper's command line contains that string - the AGENTS.md section 3 trap, this time
+producing false alarms rather than a self-kill.  The bracket form `pgrep -af "[c]lang"` does not, and the
+confirmation run above uses it.
