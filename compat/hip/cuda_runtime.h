@@ -9,7 +9,7 @@
 // .rocm-eval/.  Mirrors of the same mappings exist in llama.cpp's ggml-cuda/vendors/hip.h (MIT).
 #pragma once
 
-#define STRATA_BACKEND_HIP 1
+#define STRATA_USE_HIP 1
 
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>

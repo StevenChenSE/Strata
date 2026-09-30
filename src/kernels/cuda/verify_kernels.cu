@@ -424,7 +424,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 __device__ unsigned int g_wait_obs[3] = {0, 0, 0};   // HIP DEBUG: [observed, value, spins>>16]
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     unsigned n = 0;
     for (;;) {
         const unsigned int cur = __hip_atomic_load((const unsigned int*) flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -483,7 +483,7 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     *skip = ring;
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     if (__hip_atomic_load((const unsigned int*) skip, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == value) return;
     unsigned n = 0;
     for (;;) {
@@ -568,7 +568,7 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 // a GPU timestamp (ns, %globaltimer) into buf[i] - the verify window's stage profiler
 namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     unsigned long long t;
-#if defined(__HIPCC__) || defined(STRATA_BACKEND_HIP)
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
     t = wall_clock64() * 10ull;   // gfx11: a constant 100 MHz counter, in ns
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));

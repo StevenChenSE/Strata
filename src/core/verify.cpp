@@ -141,7 +141,7 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 Verifier::~Verifier() {
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     if (ymis_dev_) { cudaFree(ymis_dev_); ymis_dev_ = nullptr; }
     if (d_flag_) cudaFree(d_flag_);
     if (d_flagA_) cudaFree(d_flagA_);
@@ -332,7 +332,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
         device_plan_ = false;   // the _or waits have no driver form; the host always publishes
 #else
         device_plan_ = v != nullptr && std::atoi(v) != 0;
@@ -347,7 +347,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); device_plan_ = false; }
     }
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     {   // device mirror of the pool's mapped y_miss rows: the DMA copy is coherent, the mapped
         // re-read is not (gfx1100 L2 caches host writes with no invalidation path)
         if (cudaMalloc((void**) &ymis_dev_, (size_t) max_t * K * N * 4) != cudaSuccess) {
@@ -416,7 +416,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     groups_[T] = G;
 
     // ---- the window's inputs, from mapped staging
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     HIP_CK(hipMemcpyAsync(tok_, m_tok_, (size_t) T * 4, hipMemcpyHostToDevice, cs));
     HIP_CK(hipMemcpyAsync(step_, m_step_, (size_t) T * kStepCount * 4, hipMemcpyHostToDevice, cs));
     HIP_CK(hipMemcpyAsync(pos_, m_pos_, (size_t) MT * (NH + NKV + IQ) * 4, hipMemcpyHostToDevice, cs));
@@ -702,7 +702,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
         // the payload goes to VRAM (the host pulls it back with a D2H DMA - shader stores to
         // mapped host memory have no writeback guarantee on RDNA3); only the ring is a doorbell
         doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K,
@@ -754,7 +754,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
             hip_wait_ge(cs, d_flagA_, ring);                   // the pool published this group's GPU plan
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
             // SDMA copies see the host's writes; a kernel re-read of mapped memory hits stale L2
             HIP_CK(hipMemcpyAsync(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, (size_t) plan_i32_ * 4,
                               hipMemcpyHostToDevice, cs));
@@ -801,11 +801,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 22, grp);
         {   // HIP: device_plan_ forced off
             hip_wait_ge(cs, d_flag_, ring);                // the CPU's share is in the mapped rows
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
             HIP_CK(hipMemcpyAsync(ymis_dev_, m_ymiss_, (size_t) max_t_ * K * N * 4, hipMemcpyHostToDevice, cs));
 #endif
             stamp(l, 23, grp);
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
             // the rows were DMA'd into ymis_dev_ above; gather from the device copy (fresh)
             const float* ysrc = (const float*) ymis_dev_ + (size_t) tb * K * N;
 #else
@@ -1084,7 +1084,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     HIP_CK(hipMemsetAsync(d_flag_, 0, 4, cs_));
     HIP_CK(hipMemsetAsync(d_flagA_, 0, 4, cs_));
     HIP_CK(hipMemsetAsync(d_flagB_, 0, 4, cs_));
@@ -1102,7 +1102,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     const unsigned base0 = seq_base_;
     seq_base_ += (unsigned) ((le_ - lb_) * G);   // advance on every launched path (R5)
 #endif
@@ -1115,7 +1115,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
         const int timeout_s = [] { const char* e = std::getenv("STRATA_VERIFY_TIMEOUT_S"); return e ? std::atoi(e) : 20; }();
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
         // one CP wait packet for the layer's ring (R4): no polling traffic, and the driver's wait
         // observes the GPU's own VRAM increment (device scope through L2).  Bounded so the host
         // can still diagnose and exit.
@@ -1214,16 +1214,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
             hip_raise(hip_dma_, d_flagA_, want);
 #endif
             raise_flag(h_flagB_, want);
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
             hip_raise(hip_dma_, d_flagB_, want);
 #endif
         }
         *flag = want;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
         hip_raise(hip_dma_, d_flag_, want);
 #endif
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -1234,7 +1234,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     HIP_CK(hipStreamSynchronize(hip_dma_));
 #endif
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
@@ -1341,7 +1341,7 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     // The B doorbell lives in VRAM and must be raised by a CP write ON THE COPY STREAM: that
     // orders it after the staging DMAs above (the whole point of flag B) and a shader's glc
     // load sees VRAM through L2.  A shader can never observe a host store to mapped memory
@@ -1367,7 +1367,7 @@ void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     hip_raise(v->hip_dma_, v->d_flagA_, v->cur_layer_ + 1);
 #endif
 }

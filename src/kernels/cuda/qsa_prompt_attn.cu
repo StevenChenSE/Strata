@@ -41,7 +41,7 @@ constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free 
 // When it is absent the emulated mma16816 below stays in use.
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
-#if !STRATA_PA_SM80 && defined(STRATA_BACKEND_HIP)
+#if !STRATA_PA_SM80 && defined(STRATA_USE_HIP)
     // gfx1100 has no mma.sync.  Fragment-preserving scalar emulation: keep every register in the
     // PTX m16n8k16 f16 layout (the kernel's downstream indexing depends on it) and rebuild the
     // full K range per lane with shuffles.  Lane L (gid = L>>2, tig = L&3) holds
@@ -1047,7 +1047,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
-#if defined(STRATA_BACKEND_HIP)
+#if defined(STRATA_USE_HIP)
 #if defined(STRATA_WMMA_GFX11) && STRATA_WMMA_GFX11
     static const bool pa_wmma_enabled = []() {
         const char* env = std::getenv("STRATA_PA_WMMA");

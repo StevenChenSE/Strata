@@ -203,7 +203,7 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// very expensive substitute for one fence instruction.
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     // gfx11: a plain volatile store may not reach host memory promptly enough for the polling CPU
     // (and the wait's volatile loads may be served stale); system-scope atomics are the contract.
     __hip_atomic_store((unsigned int*) seq, *seq + 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -213,7 +213,7 @@ __global__ void doorbell_ring_kernel(uint32_t* seq) {
 }
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     // Re-read seq every iteration: a stale want (read before the previous segment's ring landed)
     // would wait for an equality the host has already passed, which deadlocks the handshake.
     for (;;) {

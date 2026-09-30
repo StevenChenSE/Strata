@@ -2,7 +2,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
 #include "wmma_gemm.h"
 #endif
 
@@ -345,7 +345,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     // STRATA_WMMA_GEMM=0 is the A/B arm: force the hipblasGemmEx path even where WMMA would be used.
     // STRATA_WMMA_BF16=0 exists so the bf16 increment can be measured separately from the fp16 one.  The arch
     // macro that gates the implementation comes from the build (see wmma_gemm.cu); if it is absent the call
@@ -375,7 +375,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
-#ifdef STRATA_BACKEND_HIP
+#ifdef STRATA_USE_HIP
     // STRATA_WMMA_GEMM=0 is the A/B arm: force the hipblasGemmEx path even where WMMA would be used.  The
     // arch macro that gates the implementation comes from the build (see wmma_gemm.cu); if it is absent the
     // call returns false and this falls through, so a non-gfx11 build cannot silently run empty stubs.

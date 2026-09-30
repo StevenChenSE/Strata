@@ -33,7 +33,7 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
 add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 STRATA_BACKEND_HIP=1)
+target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1)
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 foreach(_language IN ITEMS CXX HIP)
   target_compile_options(strata_hip_runtime INTERFACE

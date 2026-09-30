@@ -1,6 +1,6 @@
 #pragma once
 // Included only by STRATA_ENABLE_HIP builds. CUDA builds use NVIDIA headers.
-#define STRATA_BACKEND_HIP 1
+#define STRATA_USE_HIP 1
 #include <hip/hip_runtime.h>
 #include <hip/hip_math_constants.h>
 #ifndef CUDART_INF_F

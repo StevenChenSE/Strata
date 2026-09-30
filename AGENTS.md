@@ -142,7 +142,9 @@ Useful env: `STRATA_VERIFY_DEBUG=1` (per-layer capture/serve trace), `STRATA_VER
   its first *unsatisfied* poll and never re-read its flag. It presented as a nondeterministic
   "wait kernel spinning at 95 % GPU while the raise sits in memory". Fixed by counting down from
   `(ns + 31) / 32`. **Audit every `for`/`while` with an unsigned counter that decrements, in the shim
-  and in kernels.**
+  and in kernels.** Note that `compat/hip/` is no longer wired into the build (the merge of upstream's
+  backend replaced it with `include/strata/hip_compat/`, where the fixed countdown lives at
+  `intrinsics.hpp`); the file remains in the tree but nothing compiles it.
 * **A probe that bypasses the shim can mask a shim bug.** Five probes "proved" the doorbell primitives
   worked because each defined its own `__nanosleep` via `__builtin_amdgcn_s_sleep` directly and so never
   entered `strata_hip_nanosleep`. When a probe says a primitive works but the engine says it does not,
@@ -157,9 +159,11 @@ Useful env: `STRATA_VERIFY_DEBUG=1` (per-layer capture/serve trace), `STRATA_VER
   batch rather than launch them.
 * HIP contracts `__fmul_rn`/`__fadd_rn` into `v_fmac_f32`; the shim routes them through inline asm.
   Anything bit-exact depends on that.
-* `src/core/verify.cpp` currently uses `hip*` symbols in code that a CUDA build also compiles
-  (`hip_wait_ge`, `hip_raise`, `HIP_CK`). Keep HIP-only code inside `#ifdef STRATA_BACKEND_HIP` — the
-  CUDA path is still the product.
+* `src/core/verify.cpp` uses `hip*` symbols in code that a CUDA build also compiles
+  (`hip_wait_ge`, `hip_raise`, `HIP_CK`). Keep HIP-only code inside `#ifdef STRATA_USE_HIP` — the
+  CUDA path is still the product. (This branch used to carry its own `STRATA_BACKEND_HIP` for the same
+  condition; it was collapsed into upstream's name in `4c483ff`, which also removed the duplicate
+  definition from `cmake/hip_backend.cmake`.)
 * The non-verify decode path (`session.cpp:842` → `elementwise.cu:215` `doorbell_wait_kernel`) still
   spins on a **mapped-host** flag, which gfx11 serves stale for in-flight re-reads. It is unreachable
   for a native IQ pack (`--spec T` with `T >= 2` is mandatory, so the verify window is the only decode
