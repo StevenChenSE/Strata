@@ -99,3 +99,50 @@ The merge test resolved all 11 conflicts by taking **ours** purely to get a buil
 not the recommended resolution.  The build failure it produced is therefore *expected* and is evidence about the
 compat layers, not about the 18 hunks.  Nothing here was validated on a working merged binary - the next round's
 job is to produce one and measure it.
+
+## Merge attempt: it builds, but it does not hold our performance yet
+
+Following the recommendation above, the merge was carried out in the worktree `/tmp/strata-rebase` on branch
+`rebase-test` (our `hip-gfx1100` was never touched), with the per-file strategy from the section above, and then
+built and gated.  Commit **`dd51c89`** ("merge origin/main (upstream gfx1100 backend) with our kernels"), 0 compile
+errors, binary `build-merge/strata-hip` (25.9 MB).
+
+Verified independently rather than taken from the implementation summary:
+
+| claim | evidence |
+| --- | --- |
+| single compat layer | `compat/hip` appears only in a stale comment in `CMakeLists.txt`; the build links upstream's `strata_hip_runtime` |
+| our WMMA dispatch survives | `src/prefill/gemm.cu` calls `strata_wmma_gemm_bf16` / `_f16` *before* `try_hipblaslt` (lines ~356/384 vs ~362/390) |
+| WMMA not silently stubbed | `STRATA_WMMA_GFX11=1` present 5x in `build-merge/CMakeFiles/{strata_kernels_hip,strata_prefill_hip}.dir/flags.make` |
+| the nanosleep fix survived | countdown loop ported into `include/strata/hip_compat/intrinsics.hpp:110`; `verify_kernels.cu` and `elementwise.cu` still call `__nanosleep` |
+
+One behavioural difference worth flagging: the ported helper sleeps `__builtin_amdgcn_s_sleep(1)` per iteration
+where our shim slept `s_sleep(8)` - so the same number of iterations now pace 8x tighter, which changes how hard
+the doorbell waits spin.
+
+**The gate fails.**  `bench/tools/gate_merged.py` runs the pre-merge and merged binaries on identical explicit
+flags in the same session, interleaved (2 reps; a hang counts as failure and there were none):
+
+| prompt | arm | pp median (range) | tg median (range) |
+| --- | --- | ---: | ---: |
+| 1K | old | **582.2** (581-583) | 48.4 (48.3-48.5) |
+| 1K | merged | 530.9 (456-606) | 45.9 (45.1-46.6) |
+| 4K | old | **935.8** (933-938) | 47.6 (46.6-48.6) |
+| 4K | merged | **825.0** (797-853) | 51.2 (48.7-53.7) |
+
+Against our recorded same-session numbers the merged build is -8.0 % pp / -3.6 % tg at 1K and -10.6 % pp /
++3.4 % tg at 4K.  The 4K prefill deficit is the solid finding: both merged runs (797, 853) sit below both old runs
+(933, 938) with no overlap.  The 1K merged arm is bimodal (606 then 456), so its median is weak evidence.
+
+**So the merge is mechanically successful and performance-incomplete.**  A merged build that carries our WMMA GEMM
+and attention *and* upstream's 46 commits should be at or above parity; being ~10 % under it on prefill means
+something in the combination is worse than either side, and that has to be attributed before adopting it.
+Candidates, in the order they are cheapest to test:
+
+1. **The hipBLASLt fallback.**  Our tree had no hipBLASLt path at all; the merged `gemm.cu` falls through to
+   `try_hipblaslt` whenever our WMMA declines a shape.  Their calibration table does *not* load here
+   (`file=100100 runtime=100401`), so those fallbacks run on an uncalibrated path that our pre-merge binary never
+   touched.  Test: `STRATA_WMMA_GEMM`/shape probes, or build with the hipBLASLt path disabled.
+2. **The nanosleep pacing** above (`s_sleep(1)` vs `s_sleep(8)`).
+3. **Upstream's prefill changes** (+267 lines in `prefill.cpp`, plus their staging/chunking), against which our
+   instrumentation was re-applied - our `--prefill 2048` may no longer mean what it did.

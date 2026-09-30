@@ -2227,3 +2227,14 @@ our base is 0.1.22, so a rebase also picks up six releases of engine work).  Mea
 So the work is a bounded port of our value-add (WMMA GEMM + WMMA attention + prefill instrumentation + MMQ gather
 batching + the launcher/bench record) onto their backend, not a ground-up merge.  Full detail, tables and the
 recommended path: [REBASE-UPSTREAM.md](REBASE-UPSTREAM.md).
+
+## Merge attempt and perf gate
+
+The merge recommended by the investigation was carried out in the worktree (branch `rebase-test`, commit
+`dd51c89`): it **builds with 0 errors** and my independent checks confirm a single HIP compat layer, our WMMA
+dispatch first in `gemm.cu`, and `STRATA_WMMA_GFX11` defined.  But the perf gate **fails**: on identical flags,
+interleaved in the same session, the merged binary is **-8.8 % pp at 1K and -11.8 % pp at 4K** against the
+pre-merge binary (4K: 797/853 vs 933/938, no overlap), with tg roughly neutral.  Candidate causes - the new
+hipBLASLt fallback running uncalibrated (their table is version-mismatched here), the ported nanosleep pacing
+(`s_sleep(1)` vs our `s_sleep(8)`), and upstream's reworked prefill - are listed in
+[REBASE-UPSTREAM.md](REBASE-UPSTREAM.md).  Harness: `bench/tools/gate_merged.py`.
