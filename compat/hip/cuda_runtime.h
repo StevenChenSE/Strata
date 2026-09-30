@@ -181,9 +181,14 @@ __device__ inline float strata_fsub_rn(float a, float b) {
 
 // gfx1100 has no nanosleep facility; these calls back off a doorbell spin-wait, where pacing (not
 // precision) is what matters.  s_sleep takes an immediate operand, hence the constant-sleep loop.
+// NOTE: the loop must count DOWN from a quotient, not subtract from `ns` until it is zero - with
+// ns = 100 the old form ran 100, 68, 36, 4, 4294967268, ... and never hit 0 (the value is invariant
+// mod 32 and 2^32 is a multiple of 32), so the FIRST unsatisfied poll spun here forever and never
+// re-read its flag.  Every engine wait that was not already satisfied on its first load hung in this
+// loop (rocgdb: `strata_hip_nanosleep (ns=2583458180)`, and 2583458180 % 32 == 4).
 #if defined(__HIP_DEVICE_COMPILE__)
 __device__ inline void strata_hip_nanosleep(unsigned ns) {
-    for (; ns; ns -= 32u) __builtin_amdgcn_s_sleep(8);
+    for (unsigned k = (ns + 31u) / 32u; k; --k) __builtin_amdgcn_s_sleep(8);
 }
 #define __nanosleep(ns) strata_hip_nanosleep((unsigned) (ns))
 
