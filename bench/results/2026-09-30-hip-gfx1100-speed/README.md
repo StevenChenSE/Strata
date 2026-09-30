@@ -595,3 +595,34 @@ x8 link, which carries 47 % of the 4K prefill's bytes, (b) rocBLAS's missing WMM
 projections (43 % of the 1K prefill), and (c) the emulated `mma16816` prompt attention (13 % at 4K).
 Only (c) and a hand-written WMMA GEMM would be addressable in software, and both are projects rather than
 patches.  ROCm issue worth noting for the record: `rocblas` fp16 GEMM on gfx1100, any shape, ~14 TFLOPS.
+
+## Round 14: the window is capped at 6 tokens by a shared-memory limit (latent bug), and --spec-min-p is fine
+
+Sweeping the draft depth and the acceptance threshold on the recommended MTP configuration:
+
+| config | tokens/round | draft accept | decode |
+| --- | ---: | ---: | ---: |
+| `--spec 4 --spec-min-p 0.5` (default) | 3.20 | 0.848 | 47.74 tok/s |
+| `--spec 4 --spec-min-p 0.3` | 3.37 | 0.804 | 46.50 tok/s |
+| `--spec 6` | **segfault (exit 139)** | - | - |
+| `--spec 8` | **segfault (exit 139)** | - | - |
+
+`--spec-min-p 0.3` buys more accepted tokens per round (3.37 vs 3.20) but costs more verification, so the
+default 0.5 stays.  The segfaults are a real defect, not a tuning result:
+
+`src/kernels/cuda/fused_gr.cu:299` (`fused_gr_read_multi`) launches `gr_down_multi_kernel` with
+`n_tok * TILE * sizeof(float)` of dynamic shared memory, `TILE = 2560` -> **10,240 B per token**, while the
+opt-in it requests is `min(kFusedGrMaxT * TILE * 4, cudaDevAttrMaxSharedMemoryPerBlockOptin)`.  On gfx1100
+that attribute is 65,536 B, so:
+
+| window | smem needed | launch |
+| ---: | ---: | --- |
+| 6 (i.e. `--spec 4`) | 61,440 B | ok |
+| 7 (`--spec 5`) | 71,680 B | `hipErrorInvalidArgument` |
+| 8 (`--spec 6`) | 81,920 B | fails, then the process dumps core during teardown |
+
+The verify window is `--spec + 2` tokens, so **every `--spec >= 5` crashes on any 64 KB-shared-memory
+device** - including the CUDA product on Turing, which the code's own comment acknowledges ("Turing: 64 KB -
+enough for windows of up to 6 tokens").  This also blocks measuring whether deeper draft windows help
+decode.  Delegated fix: fall back to the existing per-token `fused_gr_read` for the tokens that do not fit,
+log it once, and keep the <= 6-token fast path untouched.
