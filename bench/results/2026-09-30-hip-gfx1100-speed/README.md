@@ -1043,3 +1043,44 @@ owner should make**, not something to flip silently: `STRATA_PROMPT_ATTN_OLD=1` 
 at the cost of that parity.  The proper fix is a WMMA prompt attention: it should beat *both* paths (the
 emulated one at 1,115 ms and the old one at 604 ms per 4K prefill) while keeping fp32 accumulation, which is
 also the numerically closest thing this GPU has to CUDA's real `mma.sync`.
+
+## Round 25: is the attention-path accuracy change purely numeric? Yes - and two of my earlier claims were invalid
+
+Prompted by a direct question, this was measured properly.  Separating the two changes:
+
+**The WMMA GEMM work (fp16 and bf16) did not change accuracy.**  The 8-token seed output is bit-identical
+across the change (`271 7734 264 13280 9834 421 15339 279`, repeated), and both kernels are exact against a
+host fp64 reference on exactly-representable inputs (`maxdev = 0.000e+00`, 0 NaN, all shapes).
+
+**The attention path swap is purely a summation-order difference.**  The repo's own harness
+(`qsa_prompt_attn_parity_hip`) FP64-checks both implementations on prompt-shaped pools (2,051 selections):
+
+| case | old vs FP64 | batched vs FP64 | batched vs old |
+| --- | ---: | ---: | ---: |
+| fp16 ctx 4096, 1024 q (output scale 3.21) | 1.54e-06 | 2.68e-06 | 5.19e-06 (1.4e-06 of scale) |
+| int8 ctx 4096, 1024 q (scale 3.27) | 2.13e-06 | 3.69e-06 | 6.78e-06 (1.8e-06 of scale) |
+| int8 ctx 32768, 2048 q (scale 3.62) | 2.13e-06 | 3.76e-06 | 6.56e-06 (1.7e-06 of scale) |
+
+At token level, with a **fixed** expert cache (which makes the engine deterministic):
+
+| prompt | batched vs batched (repeat) | batched vs old (path swap) |
+| --- | --- | --- |
+| 1K real text, 128 new tokens | identical | **identical** (no divergence) |
+| 13-token seed, 128 new tokens | identical | first divergence at index **5** |
+
+So the difference is normally invisible and only flips a token where the top-2 logits are within ~1e-6 of a
+tie - the 1K prompt had none in 128 tokens, the seed prompt has one at index 5.
+
+**Two corrections to earlier rounds in this file:**
+
+* Round 20's "85 of 256 tokens agree" was **not valid evidence**: that run used `--expert-cache auto`, and the
+  adaptive VRAM tier makes the engine non-deterministic - *batched vs batched* diverged at the same index 85.
+  Only a fixed-cache comparison (where same-path repeats are bit-identical) means anything.
+* The 8-token seed is a **boundary** check, not an equivalence check: the same path produces `421` as its 6th
+  token at `--max-new 8` but `1608` at `--max-new 128`, because the verify window depends on the remaining
+  budget.
+
+**Unverified:** the logit vectors themselves could not be compared - `--dump-logits` writes only its 8-byte
+header under the captured-graph path (its write site is in the non-graph sampling loop) and `--dump-final-r`
+writes 0 bytes, while `--no-capture` requires `--no-pool` and changes the model.  "A near-tie flip" is
+therefore inferred from the harness's FP64 accuracy and the divergence pattern, not measured at the logits.
