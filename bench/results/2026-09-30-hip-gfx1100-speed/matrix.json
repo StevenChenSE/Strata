@@ -152,5 +152,19 @@
     "spec_accept": 0.0,
     "spec": "2",
     "suffix_draft": 24
+  },
+  {
+    "run": "4k-real-code",
+    "model": "IQ3_S",
+    "prompt_tokens": 4095,
+    "max_new": 8,
+    "exit": 0,
+    "prefill_tok_s": 494.84,
+    "prefill_ms": 8275.4,
+    "decode_tok_s": 23.07,
+    "vram_slots": 9854,
+    "experts_streamed": 26864,
+    "prompt": "real C++ 4096 tok via bench/tools/tok_ascii.py",
+    "chunks": 2
   }
 ]

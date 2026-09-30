@@ -308,3 +308,25 @@ a longer match only reduces its coverage.
 
 **Recommendation:** the only large tg lever left is the MTP draft weights (`--mtp`, a ~5 GB fetch);
 everything reachable without them is measured at or near its optimum.
+
+## Round 5: pp scaling — 1K is at CUDA parity, the 4K gap is the PCIe link
+
+4,096 tokens of real C++ (2 chunks of 2048), 256-token cache tier:
+
+| tier | HIP pp | CUDA counterpart pp | ratio |
+| --- | ---: | ---: | --- |
+| 1K | 415.7 tok/s (best) / 313-390 (spread) | 419 | ~1.0x |
+| 4K | **494.8 tok/s** (8,275 ms) | 893 | 1.80x behind |
+
+HIP improves only 1.18x from 1K to 4K where the CUDA counterpart improves 2.13x, and the reason is
+visible in the engine's own line: `experts streamed 26864 (26864 by DMA)` for 4,095 tokens, i.e.
+**~6.6 expert blobs per token, the same rate as at 1K (6.8)** - the cache does not capture a larger
+share as the prompt grows, because the prompt's working set grows too (48 layers x up to 512 experts =
+24,576 distinct against 9,854 resident slots).  At ~1.7 MB per blob that is ~45.7 GB over a link
+measured at 14.2 GB/s = **~3.2 s of the 8.3 s prefill, 39 %**.
+
+This box's slot is PCIe 4.0 **x8** (the user's x16 is split with another GPU; measured 14.2 GB/s, and
+2 MB-blob transfers saturate it at 13.5 GB/s), while the CUDA counterpart sits on PCIe 5.0 x16.  So the
+pp gap at 4K is a hardware bandwidth gap over *expert-streaming bytes*, and the remaining software lever
+there is fewer streamed bytes (residency/profile), not kernel work: the non-streaming part of the
+prefill is comparable between the two boxes.
