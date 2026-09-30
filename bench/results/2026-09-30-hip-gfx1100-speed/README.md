@@ -1910,3 +1910,42 @@ rather than in `/tmp`, which is what lost them.
 native packs) rather than link-aware, so with twice the bandwidth the optimum has likely moved up - which is
 exactly what the +43 % decode gain at 32K hints at; and the copy ring's time-depth halved (384 slots is now
 ~27 ms of buffer rather than 58), so its optimum may have shifted too.
+
+## Page-fault provenance: the variance is not the engine paging, but the PLE's working set is pinnable
+
+`bench/tools/fault_probe.py` samples the engine's own `/proc/<pid>/{stat,io,status}` plus system-wide PSI while
+each run proceeds.  (Caveat: the script's `read_bytes` column is mis-parsed and unreliable here - the fault
+counters and PSI are the trustworthy ones.)
+
+**Phase A, the default `--ple-io direct`, 6 runs at 4K:**
+
+| run | pp ms | minflt | **majflt** | PSI io stall | PSI cpu stall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fast | 4,515 | 13.24 M | **0** | 1,412 ms | 709 ms |
+| slow | 5,141 | 13.24 M | **0** | **6,596 ms** | 926 ms |
+
+**Major faults are zero in both the fast and the slow run.**  In `direct` mode the PLE rows are read with
+O_DIRECT, so no mapping exists, nothing is faulted in from the shard, and **pinning the PLE table cannot explain
+or fix this variance**.  What *does* move with the slow run is the **system-wide PSI I/O stall** (1.4 s -> 6.6 s),
+i.e. another process's I/O pressure - the host-interference diagnosis, now with a counter attached.
+
+**Phase B, `--ple-io mmap` with the shard warmed by `dd`, 4 runs:**
+
+| run | pp ms | majflt | gguf mapping resident |
+| --- | ---: | ---: | ---: |
+| 0 (cold) | **8,917** | **56,042** | 2,276 MB |
+| 1 | 4,365 | 5,211 | 2,276 MB |
+| 2 | 4,441 | 4 | 2,276 MB |
+| 3 | 4,308 | **0** | 2,276 MB |
+| median | **4,403** | | |
+
+So `mmap`, **once the touched pages are resident, is ~5 % faster than `direct`** (median 4,403 vs 4,627 ms) - but
+a cold run costs 56,042 major faults and **doubles** the prefill.  And the mapping only ever holds **2.3 GB**: the
+engine touches a small working set of the 26.8 GiB shard, which is why it fits beside the ~48 GiB expert arena
+while the whole table would not.
+
+**Consequence.**  The user's instinct is right in a sharper form than "pin the PLE table": the table is 26.8 GiB
+and would not fit, but its **2.3 GB working set would**, and pinning that turns the `mmap` path from
+fast-but-fragile into fast-and-stable (48 GiB arena + 2.3 GiB = ~50 of 92 GiB).  Nothing in the engine prefaults
+or locks those pages today.  The default `direct` path stays the robust choice; the variance itself lives in
+other processes' I/O, not ours.
