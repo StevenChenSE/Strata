@@ -405,3 +405,28 @@ at **8,275 / 8,386 / 8,517 ms** with that single 10,159 ms outlier.  So:
 A related hygiene note: the CPU governor is `powersave` (the CPU was observed at 5.37 GHz, so it does
 boost), and the prefill's host-side work is CPU-heavy enough that frequency state is a plausible
 contributor to the residual few-percent spread.
+
+## Round 8: the dense projections are launch-bound; the GDN recurrence is not the cost
+
+`bench/tools/prof_prefill.py` (new) aggregates a rocprofv3 kernel trace into prefill vs decode, using the
+verify window's first `wait_flag_ge_kernel` as the separator.  On the 12-token prefill trace:
+
+| group | ms | % | launches |
+| --- | ---: | ---: | ---: |
+| **rocBLAS GEMM** | 144.3 | **42.3** | **1,420** |
+| dequant (weight -> f16) | 81.4 | 23.9 | 300 |
+| runtime copy/fill | 74.4 | 21.8 | 10,707 |
+| MMQ (quantized GEMM) | 35.7 | 10.5 | 3,458 |
+| **gdn recurrence** | **0.65** | **0.2** | 36 |
+
+Two conclusions:
+
+* **1,420 rocBLAS launches at ~0.1 ms each** - for a 12-token prompt the dense projections are almost
+  purely launch latency, which is why the phase table showed `qsa proj` barely growing from T=12 to T=1023.
+  Graph-capturing the prompt path (the machinery already exists for the verify window) or batching the
+  projections is the lever for short prompts; at 4K the same launches are ~6 % of the prefill, so this is
+  a 1K-shaped win, not the 4K one.
+* **The GDN recurrence is 0.65 ms** even in a phase table that charges 24 % to "gdn" - so that phase is its
+  five *projections* (`Gemm::native` = `dequant_f16` + rocBLAS, prefill.cpp:683 -> gemm.cu:96), not the
+  recurrence.  `use_mmq` (prefill.cpp:1320) covers only the expert GEMMs; the 12 dense `native_proj` sites
+  always dequantize the weight into scratch first, per chunk.
