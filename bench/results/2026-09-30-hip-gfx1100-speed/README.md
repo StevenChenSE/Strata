@@ -1868,3 +1868,45 @@ doing, which is not something this engine controls.
 (= 58 ms) ahead, the waits are already satisfied at enqueue time, and the stalls that remain are host-side.  The
 cheap part of the lever was taken by the default (worth 6.2 % against a shallow ring), and there is nothing
 further in the GPU pipeline to recover.
+
+## PCIe 4.0 x16: the link was the long-context ceiling, and removing it moved everything
+
+The other card was removed from the shared x16 slot, so this GPU now has the full link.  Verified with the
+probes and the engine's own startup measurement:
+
+| measurement | at x8 | at x16 |
+| --- | ---: | ---: |
+| H2D 2 MB blobs (expert blob shape) | 13.5 GB/s | **25.8 GB/s** |
+| H2D host-registered 256 MB x4 | 14.2 | **28.4** |
+| D2H pinned 256 MB x4 | 13.5 | **25.5** |
+| engine's own startup probe | 14.2 | **28.7** |
+
+Re-measured with the identical configuration (medians; the 1K prompt is bit-identical to the one used for every
+earlier 1K number - tokens from `src/core/expert_source.cpp`, and `experts streamed 10503 / resident 8694` against
+10,504 / 8,696 before):
+
+| tier | before (x8) | **now (x16)** | change | counterpart | ratio now |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| pp @1K | 408.5 | **602.5** | **+47 %** | 419 | **144 %** |
+| pp @4K | 676-707 | **1,016** | +44-50 % | 893 | **114 %** |
+| pp @32K | 677.4 | **1,079.2** | **+59 %** | ~1,490 | 72 % |
+| tg @1K (128 tk) | 45.0 | **46.5** | +3.3 % | 50.5 | 92 % |
+| tg @32K (32 tk) | 32.4 | **46.3** | **+43 %** | 49.0 | **94 %** |
+
+The 4K phase table shows why: `wait copy` fell from ~2,000 ms to **378 ms**, the gather's idle from ~400 to 228,
+and the GEMM phases barely moved (gate/up 790 -> 560, down ~400 -> 281).  The prefill is no longer
+streaming-bound at 4K.
+
+**Caveats.**  The 4K prompt had to be regenerated (the old `/tmp` prompts did not survive the machine's
+shutdown) and its routing differs - `experts streamed 23,099` against ~26,700-27,500 before - so the 4K gain is
+*not* strictly like-for-like and is likely somewhat flattered, since it streams less.  The 1K prompt is exact and
+the 32K one routes within 1.1 % (259,560 vs 262,555), so those two tiers are sound.  The 4K spread also remains
+large (889.9-1179.7 tok/s, +-15 %), so its median is the number to quote, not a single run.
+
+**Prompts are now in the repository** (`bench/tools/prompts/{1k,4k,32k}.txt`, deterministic first-N-token cuts)
+rather than in `/tmp`, which is what lost them.
+
+**Two levers this opens**, both zero-code and worth testing: `--pcie-frac` is a *static model default* (0.55 for
+native packs) rather than link-aware, so with twice the bandwidth the optimum has likely moved up - which is
+exactly what the +43 % decode gain at 32K hints at; and the copy ring's time-depth halved (384 slots is now
+~27 ms of buffer rather than 58), so its optimum may have shifted too.
