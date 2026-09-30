@@ -1253,3 +1253,39 @@ explanations account for it.  What is left, in order of plausibility:
 The next instrument is a rocprofv3 trace of a 32K prefill: it would show the copy engine's busy fraction and,
 crucially, *where* its gaps sit (during resident runs? at layer boundaries? at chunk boundaries?).  That is a
 direct measurement, unlike the phase table's aggregate.
+
+## Round 29: batching the gather removes 6 s of launch overhead from one phase and it reappears in the next - the launches were not on the critical path
+
+`workflow-18` added `mmq::gather_native_batch` (2D-grid copy kernels, one launch per 16-expert group, pointers
+passed by value in the kernarg) and a call site that defers the gather to the group's last expert, with
+`STRATA_MMQ_GATHER=per_expert` as the A/B arm.  It also added a fallback I had not asked for but which is
+correct: batching is disabled when the staging ring is smaller than `MMQ_GROUP`, which would otherwise
+deadlock waiting for slots the group is holding.
+
+32K A/B (`--max-context 36864 --max-new 8`, `STRATA_PREFILL_TIMING=1`):
+
+| | batched (default) | per_expert |
+| --- | ---: | ---: |
+| total | 48,442.6 ms (676.4 tok/s) | 49,241.1 ms (665.4) |
+| `dequant` | **3,975 ms (8.2 %)** | 9,921 ms (20.2 %) |
+| `wait copy` | **14,955 ms (30.9 %)** | 9,829 ms (20.0 %) |
+| the two together | **18,930 ms** | 19,750 ms |
+
+So the batching **halved the gather phase (-5,946 ms)** - i.e. ~6 s of that phase really was launch overhead,
+and the Round 16 explanation ("mostly arrival waits") was wrong about the mechanism - but **almost the same
+amount reappeared as `wait copy` (+5,126 ms)**: the idle *moved* instead of disappearing, and the total moved
+only 1.6 %, inside the run-to-run spread.  The combined pair of phases (-820 ms) accounts for the total
+difference (-798 ms), which is a useful cross-check that the phase marks are consistent.
+
+The conclusion is that the per-expert gather launches were **filling GPU time that was already idle**, waiting
+on the expert stream - they were never on the critical path.  The change is kept (it removes 246,145 launches
+per 32K prefill, so less host work and less risk of host-side hiccups, and it is reversible through the env
+gate), but it is not a performance win and the report says so.
+
+This also sharpens the standing question.  The 32K run uses the `stream_all` walk (`m.ring` 384 > `STAGE`), in
+which the chunk's non-resident experts are issued in layer order through a 384-slot ring - so the copy stream
+is *not* short of queued work, yet it still runs at 11.3 GB/s against the 13.5 GB/s probe peak.  The remaining
+explanation is that the copy engine is shared with the engine's other DMA traffic (pool rows, KV staging, PLE
+rows, doorbell payloads), which the concurrent-D2D probe reproduced as a -6 % tax.  If so, the link is busy
+close to 100 % with a *mix* of useful traffic, and the "16 % idle" is not idle at all.  `rocprofv3
+--memory-copy-trace` on a 4K prefill can settle it by summing the copied bytes by category.
