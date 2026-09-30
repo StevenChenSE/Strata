@@ -1836,3 +1836,35 @@ real, just small, and 384 is the right setting.
 **Consequences.**  The performance numbers in this file all used the default, so they stand unchanged.  What
 changes is the claim that the ring is not a lever and that the fix direction left for `wait copy` is only the
 copy-supply decoupling: the cheap part of that lever is already taken, at +6.2 %.
+
+## The last direction closes: the residual `wait copy` is host-driven, so no GPU pipeline change can reach it
+
+Reading the issuer thread (`prefill.cpp:985-1011`) settles it:
+
+    for (size_t idx = 0; idx < seq.size(); ++idx) {
+        while (idx >= a_consumed.load() + (size_t) m.ring) { ... yield ... }   // cap at ring ahead
+        const int sl = (int) (idx % (size_t) m.ring);
+        if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);      // wait for entry idx - ring
+        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, ..., m.copy);
+        ...
+
+The cap at `consumed + ring` means every enqueued copy's wait is for an entry **already consumed** when it is
+enqueued, so those waits never actually block: the copy stream is simply kept exactly `ring` entries ahead. That
+makes the buffer depth the whole story:
+
+* **96 -> 384 buys +6.2 %** because 96 slots is 14 ms of copy work against stalls of ~26 ms, while 384 slots is
+  58 ms and covers them;
+* **384 -> 512 buys nothing** (measured neutral) because the short stalls are already covered;
+* the residual idle must therefore come from stalls *longer* than 58 ms.
+
+And those are the host's.  The two independent measurements that said so are already in this file: the slow 4K
+runs inflate exactly the two stream-wait phases while every GPU-side counter stays identical, and the cause was
+traced to host-side interference (another process taking CPU or host-memory bandwidth) - the same signature as
+the recorded "download during a benchmark" case.  The two remaining host-side stalls are the per-chunk setup
+(the PLE rows and the embedding gather, ~200 ms of a ~5,800 ms prefill, 3.4 %) and whatever else the box is
+doing, which is not something this engine controls.
+
+**So the copy-supply decoupling - the last untested direction - cannot help.**  The supply is already 384 entries
+(= 58 ms) ahead, the waits are already satisfied at enqueue time, and the stalls that remain are host-side.  The
+cheap part of the lever was taken by the default (worth 6.2 % against a shallow ring), and there is nothing
+further in the GPU pipeline to recover.
