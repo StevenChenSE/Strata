@@ -1429,3 +1429,35 @@ Ruled out as the explanation: the LM head on the CPU (`src/core/native_head.cpp`
 device, and its FP64-accurate path is a GPU kernel), the QSA attention (the selection reads a bounded cell set,
 ~0.05 ms of MACs per token), and the MTP drafting (the profile measures 1.5-4.2 ms per *round*).  What would
 settle it is a timer inside the window itself, per verified token, rather than the current per-round labels.
+
+## Round 34: the decode is ~65 % expert-staging handshake and ~25 % arithmetic (kernel trace)
+
+`rocprofv3 --kernel-trace` on a 12-token decode (`--spec 4` + MTP, 1K prompt), split at the first
+`wait_flag_ge_kernel` and aggregated over the 12,638 decode-side kernels (the run took 384.9 ms under tracing,
+so read shares, not absolutes; and note tracing *inflates waits* specifically):
+
+| kernel | total | share | launches |
+| --- | ---: | ---: | ---: |
+| `fetch_blobs_kernel` | 96.6 ms | 24.7 % | 192 |
+| `__amd_rocclr_streamOpsWait` | 92.2 ms | 23.6 % | 192 |
+| `wait_flag_ge_kernel` | 64.3 ms | 16.5 % | 576 |
+| `native_mmvq_m...` (all variants) | ~40 ms | ~10 % | 654 |
+| `native_down_k...` | 13.1 ms | 3.4 % | 312 |
+| `gr_down_multi` / `gr_up_multi` / `gr_norm_multi` | 17.0 ms | 4.4 % | 1,209 |
+| `__amd_rocclr_copyBuffer` | 13.6 ms | 3.5 % | 982 |
+
+Two facts stand out:
+
+* **192 = 48 layers x 4 rounds**, so the staging handshake happens once per layer per round - 503 us of
+  `fetch_blobs` and 480 us of stream-ops wait per layer.  **~65 % of the decode is that plumbing and only ~25 %
+  is arithmetic.**  The math kernels sum to a quarter *even with waits inflated by tracing*, so the direction is
+  robust even though the exact share is not.
+* The untraced round (85.7 ms at this window) is close to the profiled window (34.5 ms, which *contains* the
+  pool's 33.6 ms) **plus** the staging time, which is what a *serialised* producer/consumer would look like: the
+  GPU appears to stall until the CPU pool delivers each layer, rather than computing layer L while the pool
+  produces L+1.  That is a hypothesis, not yet a measurement - the test is a per-verified-token timer inside the
+  window, since the current labels are per round and nested.
+
+If it holds, the lever is the same one the prefill's `wait copy` pointed at, one level down: **overlap the
+expert staging with the compute instead of lock-stepping per layer.**  The payload is large - the decode is
+41.5 tok/s against the counterpart's 50.5 at 1K and 37.9 against 49.0 at 32K.
