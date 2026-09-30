@@ -346,3 +346,37 @@ understated.  Recomputed at the measured 14.2 GB/s link:
 
 Nearly half of the 4K prefill is expert bytes crossing a PCIe 4.0 x8 link.  That is the pp gap, and it
 also bounds what any kernel work can recover on this box.
+
+## Round 6: 4K prefill attribution, and a falsified ring hypothesis
+
+Full phase table at 4,095 tokens / 2 chunks (`STRATA_PREFILL_TIMING=1 STRATA_PREFILL_RING=384`):
+
+| phase | ms | % | | phase | ms | % |
+| --- | ---: | ---: | --- | ---: | ---: |
+| **gdn** | 1,990 | **23.9** | | **wait copy** | 1,006 | 12.1 |
+| **qsa attn** | 1,104 | **13.2** | | **hc read** | 990 | 11.9 |
+| dequant | 930 | 11.2 | | qsa proj | 467 | 5.6 |
+| gemm gate/up | 820 | 9.8 | | gemm down | 386 | 4.6 |
+| router+shared | 277 | 3.3 | | embed+steps | 214 | 2.6 |
+| combine/host grouping/ple/gather/select | 156 | 1.9 | | | |
+
+Two corrections to earlier reasoning:
+
+* **The scaling culprit is the prompt attention, not staging.** `qsa attn` grows 112 ms -> 1,104 ms for 4x
+  the tokens (superlinear), so on gfx1100 the emulated `mma16816` prompt attention is ~3 % of the prefill
+  at 1K but **13 % at 4K** and would keep growing.  At 1K the phase table told me it was not the lever;
+  that was true only for short prompts.
+* **The staging ring is NOT the 4K problem, and the overlap is better there.**  I predicted that
+  `RING_MAX = 512`, being exactly a layer's distinct expert count, would force poor overlap at 4K and move
+  the ring optimum.  Measured, it does not:
+
+  | ring | 4K pp | streamed | exposed wait copy |
+  | --- | ---: | ---: | ---: |
+  | 96 | 442.0 tok/s | 26,171 | 1,659 ms (18.1 %) |
+  | **384** | **480.8 tok/s** | 26,864 | **1,006 ms (12.1 %)** |
+  | 512 | 440.3 tok/s | 27,178 | 1,067 ms (11.7 %) |
+
+  384 is optimal at 4K as well, and the *exposed* copy wait is proportionally **smaller** at 4K (12.1 %)
+  than at 1K (23.6 %).  So the streaming is overlapped better on longer prompts, and the pp gap at 4K is
+  GDN (24 %) + the expert compute (26 %) + attention (19 %) + the streamed bytes themselves (47 % of the
+  prefill's bytes must cross the link), not a staging-lead problem.
