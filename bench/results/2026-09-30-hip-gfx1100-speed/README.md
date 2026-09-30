@@ -1289,3 +1289,53 @@ explanation is that the copy engine is shared with the engine's other DMA traffi
 rows, doorbell payloads), which the concurrent-D2D probe reproduced as a -6 % tax.  If so, the link is busy
 close to 100 % with a *mix* of useful traffic, and the "16 % idle" is not idle at all.  `rocprofv3
 --memory-copy-trace` on a 4K prefill can settle it by summing the copied bytes by category.
+
+## Round 30: the copy engine is idle in 54 discrete ~26 ms gaps, and the 4K variance is host-side, not GPU-side
+
+`rocprofv3 --memory-copy-trace` on a 4K prefill (38,834 transfers, 4 MB of CSV) answers where the copy engine's
+"idle" goes, and corrects two of my own stories.
+
+**When the copy engine is busy it runs at full speed.**  In the prefill window (5,412 ms, the span of the expert
+stream) there are **26,714 copies of 2 MB-class duration = 54.6 GB in 4,001 ms of copy-busy time = 13.6 GB/s** -
+exactly the standalone probe's peak.  (The 11,780 transfers I first saw on another stream are in the *model
+load* phase, not the prefill; inside the window the only other traffic is 5 ms.)  So the link is not slow and
+not contention-limited: the loss is entirely **gaps**, and they are not diffuse.
+
+**The gaps are 54 discrete events of ~26 ms each** (25.4-27.0 ms, total 1,413 ms; the remaining 24,097
+inter-copy gaps are 10-50 us of normal spacing).  Everything mechanical was tested and excluded:
+
+| hypothesis | test | result |
+| --- | --- | --- |
+| ring too small to bridge a layer's non-MoE work | `STAGE` 8 -> 16 | no change (Round 28) |
+| ring depth at 4K | `STRATA_PREFILL_RING` 96 / 192 / 384, 2 reps each | inconclusive: the same configuration spans 5,976-7,462 ms |
+| the adaptive cache tier | captured `experts streamed` / `resident` on all six runs | **identical** (26,696-26,738 / 16,232-16,264) - not the cause |
+| GPU shared with the user's work | `rocm-smi --showuse` + `fuser /dev/kfd` | GPU 0 % busy, nothing holds `/dev/kfd` |
+| CPU throttling | governor `powersave`, but 5.4 GHz measured | not throttled |
+
+**The variance is host-side.**  Capturing the engine's own host breakdown over three identical 4K runs:
+
+| rep | total | chunk setup (PLE rows, the expert stream plan) |
+| --- | ---: | ---: |
+| 1 | 6,982 ms | **720 ms** |
+| 2 | 6,015 ms | 204 ms |
+| 3 | 5,996 ms | 202 ms |
+
+so the slow run is a **3.5x larger host chunk-setup**, i.e. the PLE I/O path - and that also makes the 26 ms
+copy-engine gaps plausible as the *same* host stall propagating into the DMA issue loop.
+
+**The default I/O mode is the right one.**  `--ple-io` has two modes: `direct` (default, unbuffered SSD) and
+`mmap`:
+
+| | `direct` | `mmap` |
+| --- | ---: | ---: |
+| setup, warm | 201-207 ms (stable) | **45-47 ms** |
+| setup, cold | up to 720 ms | **3,265 ms** (10.7 s prefill) |
+
+`mmap` is 4x faster warm but catastrophic when the pages are cold, so **the default stays**, and the follow-up
+worth doing is making the PLE rows cheap *and* predictable (preload, read-ahead or a larger row cache), since
+that is worth up to ~0.5 s of a 6 s prefill and removes the ±11 % tail that has been confusing 4K A/Bs all
+session.
+
+**How to read earlier 4K numbers:** the *within-run phase attributions* are sound (a 5.5x change in `qsa attn`,
+a 2-5x change in `hc read`), but 4K *totals* carry a +/-11 % host-side spread, so single-pair 4K comparisons in
+this file are weaker than the 1K ones (whose WMMA arms held within 1.4 %).
