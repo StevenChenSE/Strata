@@ -758,3 +758,32 @@ already at 1.06x of its floor - so for long prompts the software lever is **pipe
 under the compute** (the routing for layer l+1 is only known after layer l's MoE output, so a useful
 prefetch has to be predictive - e.g. stream what the expert profile says layer l+1 is likely to need while
 layer l computes, and correct after the router runs).
+
+### Correction (Round 19): the prefill is KERNEL-bound; only 13 % of it is idle - "overlap, not bytes" was wrong
+
+Round 18 argued from arithmetic (35 s of floor DMA inside a 62.9 s prefill) that the long-prompt lever was
+overlap, implying ~65 % headroom.  That arithmetic conflated "ideal DMA time" with "serial time".  Traced
+directly at 4K with rocprofv3 (`--kernel-trace --memory-copy-trace`, window = first prompt-path GEMM to the
+first decode marker, 9,118 ms):
+
+| | busy | share |
+| --- | ---: | ---: |
+| kernels | 6,262 ms | **69 %** |
+| copy engine | 4,133 ms | 45 % |
+| **union (either busy)** | **7,906 ms** | **87 %** |
+| true idle | 1,212 ms | **13 %** |
+
+The 13 % idle matches the phase table's `wait copy` almost exactly (12.4 % at 4K), and kernels and copies
+overlap by 27 points of the window.  So the prefill is **kernel-bound with the streaming already largely
+hidden**: the recoverable overlap is ~13 %, not 65 %.
+
+Two consequences:
+
+* **`STRATA_KV_STAGE_OWN` and a deeper ring do not help** - verified that the knob takes effect (the borrow
+  grew 1020 -> 1187 slots / 1.94 -> 2.26 GiB) and pp got ~6 % *worse*, so ring depth was never the binding
+  constraint.  The ~42-58 % "link duty" I quoted earlier is simply the consumer not needing more bytes, not
+  an idle copy engine waiting to be fed.
+* **The lever is faster kernels** - 69 % of the prefill is kernel time, which is what the WMMA GEMM works on
+  (dense projections are 27-43 % of it depending on tier) and what the emulated attention and the expert MMQ
+  kernels are.  The reference project's "copy engine is idle during the GEMM" note is true of its own setup;
+  measured here, the copy engine and kernels overlap for 27 % of the window and the union leaves only 13 %.
