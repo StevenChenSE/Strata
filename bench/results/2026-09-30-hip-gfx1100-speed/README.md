@@ -925,3 +925,19 @@ contiguous in its own blob - passing a per-expert source pointer/offset (the sam
 decode path's `fetch_blobs_kernel`) would delete the gather and its extra VRAM traffic outright.  Alternatives
 are batching the gather per `MMQ_GROUP` (which sacrifices the arrival-order pipelining the comment describes) or
 capturing the walk in a graph (hard: the walk's length and order are data-dependent).
+
+#### Correction to the note above: the phase's 933 ms is not all launch cost
+
+I wrote that the `dequant` phase is "launch/host-bound".  That overstates it.  The phase timer measures the
+*stream* timeline from the `kPfDequant` mark to the next mark, so it includes idle.  The gathers themselves are
+~2 MB copies: 26,864 of them at ~3 us of VRAM traffic each is only ~80 ms of GPU work, so ~850 ms of the
+933 ms is *idle inside that phase*.  The author's comment - "the gather is per expert, as blobs arrive" - says
+the gathers are scheduled to the arrivals, so the most likely explanation for that idle is **waiting for the
+PCIe stream to deliver the next blob**, not the host enqueueing 26,864 launches (which the host-side staging
+figure, ~667 ms for 258,880 blobs at 32K, would not explain either way).
+
+What survives: the relayout is avoidable work (its ~80 ms plus a second pass of ~55 GB through VRAM), and
+removing it is still the right idea.  What does not survive: the suggestion that it is worth the whole 12 % of
+the phase.  Expected gain from deleting the gather is on the order of its own cost, and the phase's dominant
+idle needs a finer instrument (a per-launch or copy-arrival timeline) to attribute before anyone spends effort
+on it.
