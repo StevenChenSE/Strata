@@ -1780,3 +1780,26 @@ measured 41 % slower, since fusing keeps the expanded weights in shared memory i
 a VRAM scratch.  Plausible worth: 1.2-1.8x on these phases, i.e. 4-16 % of the prefill.  Cost: a new kernel per
 quantised format, of which the reference implementation of one format runs to 2,106 lines.  That is a project,
 not a bounded change, and it is the honest state of the last item.
+
+## The MMQ ceiling, measured: the engine is at 76 % of it, and the last item closes
+
+A probe (`bench/tools/dp4a_ceiling_probe.cu`) measures the two quantities that decide whether the expert MMQ is
+worth redesigning, using the same intrinsic llama.cpp uses on this architecture (`__builtin_amdgcn_sudot4` -
+RDNA3 does *not* take the `sdot4` branch, and `sdot4` needs `+dot1-insts` while `sudot4` does not):
+
+| measurement | result |
+| --- | ---: |
+| pure dot throughput | **26.3 TOPS** |
+| realistic 2-bit block dot (unpack 2-bit codes, then dot) | **21.7 TOPS** (the dot at 82 % of pure) |
+| the engine's expert MMQ (from the routing-measured pair counts) | **16.6 TFLOPS** |
+
+So the engine runs at **76 % of the measured practical ceiling**, and the headroom is **at most 1.31x** on the
+MoE phases - which are 20 % of the 4K prefill - i.e. **at most ~6 % overall**, and that bound assumes a
+redesign pays *nothing* extra for the int8->fp16 conversion a WMMA path would need.  A fused dequant-into-SMEM +
+WMMA kernel would have to beat the dot while paying the same unpacking plus that conversion, so the realistic
+prize is smaller still.  **The last item is closed: there is no worthwhile lever in the expert MMQ.**
+
+It also corrects the comparison basis used earlier in this file.  The dot-instruction peak on this card is
+26.3 TOPS, not the ~123 TOPS int8 figure quoted for the part, so the engine was **63 % of the right ceiling all
+along** - not 13 % of the wrong one - and the "apparent 10x headroom" that motivated looking here was an artefact
+of comparing against a number this instruction cannot reach.
