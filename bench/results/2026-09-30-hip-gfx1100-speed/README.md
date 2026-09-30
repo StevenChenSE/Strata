@@ -874,3 +874,19 @@ change is numerically faithful in practice.
 over-trusted arithmetic, Round 20 over-trusted a kernel-level speedup, and both times the missing step was
 confirming that the code under test actually ran.  Here the check is cheap: trace for the kernel symbol, or
 assert the linked function's size/references.
+
+### Audit: is any OTHER arch- or compiler-macro guard silently stubbing code?
+
+After the FP16 WMMA stub was found, every arch/compiler-macro guard in the port was audited:
+
+| site | guard | verdict |
+| --- | --- | --- |
+| `src/prefill/wmma_gemm.cu` | was `defined(__HIPCC__) && defined(__gfx1100__)`, plus an `!defined(__HIP_DEVICE_COMPILE__)` fallback | **the trap** - fixed to the build-provided `STRATA_WMMA_GFX11` with a false-returning fallback |
+| `include/strata/kernels/{rope,f16_bits,bf16_bits,mrope}.hpp` | `defined(__CUDACC__) || defined(__HIPCC__)` | safe: `__HIPCC__` **is** defined in both passes of this build (measured), unlike `__gfx1100__` |
+| `compat/hip/cuda_runtime.h:165,189` | `defined(__HIP_DEVICE_COMPILE__)` | safe by intent: these define device-only shim intrinsics |
+| dispatch sites (`Gemm::f16/bf16`, `use_mmq`, `STRATA_KV_STAGE_OWN`, `--adapt-every`, `--spec`) | env/CLI gates | all verified live by their observable side effects (borrow counts, log lines, phase changes) |
+
+So `wmma_gemm.cu` was the only site where a compiler macro could disagree with the build and silently select a
+stub.  The general rule this yields: **gate architecture-specific code on a macro the BUILD defines (or on
+`__HIPCC__`, which this toolchain sets in both passes), never on `__gfx1100__`, and always keep a
+false-returning fallback rather than empty kernels.**
