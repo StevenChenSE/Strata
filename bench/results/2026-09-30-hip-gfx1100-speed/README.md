@@ -538,3 +538,24 @@ expert phases:
 So 1K pp should be quoted as a **range (340-420 tok/s)** with the phase table as the explanatory artifact,
 and any A/B below ~20 % needs interleaved repetitions on an idle machine - the single biggest methodology
 lesson of this session.
+
+## Round 12: the MTP configuration that keeps pp - and 98 % of the CUDA counterpart's tg
+
+`--mtp` needs 799 MiB, which stopped a 2048-token prefill chunk from fitting at `--expert-cache 8192`.  The
+trade-off curve (same real-text prompt, 256 generated, `--spec 4 --spec-min-p 0.5`, `--prefill 2048`):
+
+| `--expert-cache` | slots | VRAM | decode | prefill | tokens/round |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **auto** | **9,492** | 18.01 GiB | **49.60 tok/s** | **328.5 tok/s** | **3.34** |
+| 6144 | 8,034 | 15.23 GiB | 42.69 tok/s | 286.1 tok/s | 3.24 |
+| 4096 | 5,341 | 10.16 GiB | 41.83 tok/s | 275.0 tok/s | 3.28 |
+
+`auto` is the answer: the engine sizes the cache to the VRAM that is actually free once the draft layer is
+resident, so the 2048-token chunk fits *and* the expert pool stays small.  Result:
+
+* **tg 49.60 tok/s against the CUDA counterpart's 50.5 = 98 % of it** (from 66 % before MTP), with better
+  acceptance (3.34 vs 2.77 tokens/round);
+* **pp 328.5 tok/s**, back inside the no-MTP 1K range (340-420), instead of the 240 tok/s that
+  `--prefill 512` cost.
+
+Recommended configuration: `--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --mtp <rt>`.
