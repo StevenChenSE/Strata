@@ -456,3 +456,27 @@ Two caveats recorded honestly:
   not a phase.  The exposed `wait copy` figure is the reproducible one.
 * the first attempt at this experiment used a 2047-token prompt, which gives engine T = 2046 - below the
   threshold, so both arms took the shallow path.  The pairing has to be 2048/2049 *tokens* for T = 2047/2048.
+
+## Round 10: decode kernel anatomy
+
+Same trace, decode window (2 rounds = 96 layer-visits, 110.5 ms of kernel time):
+
+| kernel | ms | per layer | note |
+| --- | ---: | ---: | --- |
+| `__amd_rocclr_streamOpsWait` | 33.61 | 1.0 | the `hipStreamSynchronize` in `hip_raise` - removed since |
+| `wait_flag_ge_kernel` | 21.03 | 3.0 | 0.073 ms each: three *genuine* dependency waits per layer |
+| `fetch_blobs_kernel` | 10.31 | 1.0 | 0.107 ms, grid 98,304: gathers the staged PCIe blobs |
+| `native_down_kernel<20>` | 4.12 | 1.6 | expert down projection |
+| `gr_down_multi_kernel` | 3.25 | 2.0 | gated-residual down |
+| `native_iq4_xs_mmvq_kernel<true>` | 3.06 | 0.4 | dense projection (IQ4_XS) |
+| `gr_up_multi_kernel` | 2.85 | 2.0 | gated-residual up |
+| `native_q6_k_mmvq_kernel<false>` | 2.74 | 1.3 | dense projection (Q6_K) |
+| `__amd_rocclr_copyBuffer` | 4.34 | 5.1 | runtime memcpys |
+
+So **half of the decode's GPU kernel time was the stream-ops wait plus the polling waits**, and the actual
+compute is small and fragmented: ~8 kernels per layer across dense projections, expert projections and the
+gated-residual pair, none above 0.2 ms.  Removing the sync did not return its 16.8 ms/round because a
+separate stream's shader duration overlaps the compute stream (the measured effect was 1-5 %), which is the
+same overlap lesson as before.  The three `wait_flag_ge_kernel` waits (10.5 ms/round = ~32 % of a 33 ms
+round) are *genuine* producer latency - the host's pool and the expert DMAs - so they are not removable by
+tuning the kernel; the backoff is only 100 ns (`__nanosleep(100)`), not the poll interval I first suspected.
