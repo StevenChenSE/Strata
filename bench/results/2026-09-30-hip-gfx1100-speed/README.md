@@ -1988,3 +1988,32 @@ belonged to the slow link; with `wait copy` down to 378 ms the buffer depth no l
 **Tuned configuration:** `--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --adapt-every 2
 --pcie-frac 0.30 --mtp <rt>` - worth about +10 % decode at 1K over the default on this link, with prefill
 unchanged at 1K and within noise at 32K.
+
+## Does the prompt's narrow topic range cause the variance?  No - but it does change the numbers
+
+Prompted by that hypothesis, three prompts of identical length (4,095 tokens) were built that differ only in
+diversity - `bench/tools/prompts/4k_{narrow,diverse,prose}.txt`, from one repository's C++, from three projects in
+three languages (TypeScript, CUDA C++, Python), and from markdown documentation - and measured interleaved
+within each repetition, 5 reps each, with the tuned configuration:
+
+| prompt | pp median | pp range | spread | experts streamed | resident |
+| --- | ---: | --- | ---: | ---: | ---: |
+| narrow | 910.0 | 807-933 | 3 % | 29,550 | 16,368 |
+| **diverse** | 928.8 | 924-930 | **0 %** | 30,061 | 15,613 |
+| prose | **970.6** | 897-1180 | **22 %** | **19,638** | 10,726 |
+
+**Narrowness does not explain the spread.**  The narrow prompt spreads 3 %, the diverse one 0 % - the tightest of
+the three - and the *prose* prompt is the variable one at 22 %.  So topic range is not the variance mechanism;
+if anything a lighter, more concentrated workload is the less stable one.
+
+**But the prompt does change the workload substantially**, which is a real caveat on every number in this file:
+the same-length prose prompt streams **33 % fewer experts** (19,638 against 29,550) and consequently prefills
+**6 % faster** (970.6 against 910.0).  Expert volume and throughput are prompt-dependent, so a number is only
+meaningful with its prompt - and this record's prompts are all one repository's C++, i.e. the *heavier* case for
+prefill, which makes those numbers conservative rather than flattering.
+
+**One drift worth flagging.**  The narrow prompt here measures 910 tok/s where the same recipe measured 1,016 in
+the earlier session (the x16 re-measurement), a ~10 % absolute difference on an identical prompt and
+configuration.  That is larger than the run-to-run spread within either session, so the headline 4K figure should
+be quoted as a range (~910-1,016) rather than a single value, and cross-session comparisons need the same-session
+baseline.
