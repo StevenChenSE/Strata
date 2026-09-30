@@ -380,3 +380,28 @@ Two corrections to earlier reasoning:
   than at 1K (23.6 %).  So the streaming is overlapped better on longer prompts, and the pp gap at 4K is
   GDN (24 %) + the expert compute (26 %) + attention (19 %) + the streamed bytes themselves (47 % of the
   prefill's bytes must cross the link), not a staging-lead problem.
+
+## Round 7: the GDN recurrence A/B, and a benchmarking confound to respect
+
+`src/prefill/kernels.cu` already carries an A/B switch for the GDN recurrence: unset (default) uses the
+column-parallel `gdn_rec_cols_kernel` + `gdn_out_norm_kernel`, while `STRATA_GDN_REC_HEADS=1` uses the
+one-block-per-head serial `gdn_rec_kernel`.  GDN is the largest single 4K phase (21-24 %), so it is worth
+knowing which is faster on gfx1100:
+
+| run | 4K prefill | gdn phase |
+| --- | ---: | ---: |
+| default (cols) | 10,159 ms (403 tok/s) | 2,107 ms |
+| `STRATA_GDN_REC_HEADS=1` (serial heads) | 8,386 ms (488 tok/s) | 1,880 ms |
+
+**This A/B is inconclusive, and the reason matters:** the GDN phase moved by only 227 ms while the totals
+differed by 1,772 ms, so the two runs differ in *other* phases as well - and the "slow" arm is the one
+that ran while the 5 GB MTP download was writing to the same disk/CPU.  Four same-config 4K runs cluster
+at **8,275 / 8,386 / 8,517 ms** with that single 10,159 ms outlier.  So:
+
+* do not benchmark while a download, build or other CPU/disk-heavy job is running - it produced a 20 %
+  error here, larger than the effect being measured;
+* treat the serial-heads result as unproven rather than as a win, and keep the default.
+
+A related hygiene note: the CPU governor is `powersave` (the CPU was observed at 5.37 GHz, so it does
+boost), and the prefill's host-side work is CPU-heavy enough that frequency state is a plausible
+contributor to the residual few-percent spread.
