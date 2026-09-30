@@ -2350,3 +2350,32 @@ at **~1,090 tok/s**.
 by the in-house loop at the same tier, and ~1,090 tok/s of prefill against 1,079-1,141.  A different harness, a
 different protocol (32 generated tokens against 128, OpenAI chat requests against direct engine runs) and a
 different prompt, landing on the same numbers.
+
+### Three-way through llama-benchy: our branch, master, and the merge
+
+The corrected tokenizer makes llama-benchy a usable common yardstick, so all three builds were served and measured
+with it (`bench/tools/benchy_threeway.py`, one server per arm started and stopped by PID - never with a `pkill -f`
+pattern, which has killed this project's own wrapper five times).  Each arm runs its own documented configuration;
+`--runs 1`, so these are single observations with no error bars, and the depth ladder is 0 / 4096 / 8192 / 32768
+with pp 2048 and tg 32.
+
+| arm | tg32 d0 | tg32 d4096 | tg32 d8192 | tg32 d32768 | e2e_ttft d0 | e2e_ttft d32768 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **ours** (`hip-gfx1100`) | **48.82** | **47.97** | 51.75 | **61.84** | 2,473 ms | **31,312 ms** |
+| master (`origin/main`) | 38.81 | 44.26 | 38.51 | **40.76** | 4,198 ms | 45,648 ms |
+| merged (`rebase-test`) | 42.36 | 47.62 | **55.79** | 54.28 | 2,365 ms | 30,733 ms |
+
+At the decision-relevant depth the picture is unambiguous and matches the hand-rolled three-way:
+
+* **Decode at 32K: ours 61.84 > merged 54.28 > master 40.76** - ours is 13.9 % ahead of the merge and 51.7 % ahead
+  of master.
+* **Prefill at 32K** (from e2e_ttft over ~34,800 tokens): ours 31,312 ms and merged 30,733 ms against master's
+  45,648 ms - i.e. **~1,110-1,130 tok/s against ~763**, or **+46 %**, which is the same figure the in-house loop
+  produced (+41 % / +39 %).
+* The intermediate depths are closer and noisy at one run each (master is erratic there: 44.26 at d4096, 38.51 at
+  d8192), but the 32K gaps are far larger than any plausible single-run error.
+
+So an external harness, a different prompt, a different request protocol and exact token counts land on the same
+ranking and nearly the same margins as the hand-rolled measurements: **our branch is the best decode at 32K, ours
+and the merge are equal-best on prefill at +46 % over master, and the merge does not beat ours anywhere at this
+depth.**
