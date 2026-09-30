@@ -1226,3 +1226,30 @@ Two conclusions, and they point in the same direction:
    `wait copy` at 9,772 ms and the arithmetic's 9.6 s) agree to within 2 %.  That is the remaining software
    lever at long context: prefetching deeper/earlier so the copy engine never idles while the SMs wait, which is
    what `STRATA_PREFILL_RING` and the chunked stream plan govern.
+
+### Round 28: the 21% "recoverable" streaming was wrong - the honest state of the link question
+
+The previous entry claimed the unoverlapped 21% was a software lever (`STRATA_PREFILL_RING`, prefetch depth).
+That claim does not survive testing:
+
+| hypothesis | test | result |
+| --- | --- | --- |
+| prefetch window too shallow (the prefetch window is measured in *order entries*, and 31 % of placements are already resident, so runs of resident experts issue no fetches) | `STAGE` 8 -> 16 in `prefill.cpp` | `wait copy` 9,772 -> 9,728 ms (unchanged) and the total got *worse* (47,375 -> 49,431 ms).  Reverted. |
+| VRAM contention between the DMA writes and the compute kernels | `bench/tools/h2d_contention_probes.cu` #1: 1024 x 2 MB H2D, idle vs under a saturating SM VRAM-copy kernel | 13.2 / 13.5 / 13.6 GB/s - **no effect** |
+| scattered host reads (the same 2 MB region is L3-friendly; the arena is 47 GB) | probe #2: scattered 2 MB regions in a 6 GiB pinned arena | 13.5 GB/s vs 13.1 for the same region - **no effect** |
+| 8 rotating VRAM destination slots | probe #3 | 13.5 GB/s - **no effect** |
+| other traffic sharing the copy engine | probe #3 with a concurrent D2D stream | 12.7 GB/s - **-6 %**, a partial contributor |
+
+So the engine's stream runs at 11.3 GB/s against a 13.5 GB/s probe peak (84 %), and none of the mechanical
+explanations account for it.  What is left, in order of plausibility:
+
+1. **host dispatch coupling**: at 32K the prefill issues ~262,555 DMA copies *plus* roughly a million kernel
+   launches (a gather and two MMQ launches per expert per layer) from one host thread, while the ring buffers
+   only ~1-2 ms of work - so any host hiccup stalls the DMA pipeline.  The engine reports only the *issue* cost
+   (`host staging 701 ms`), not total dispatch time, so this is unmeasured rather than disproved.
+2. accumulated small copy-engine overheads (each transfer is 2 MB, so ~148 us of data plus per-transfer setup,
+   and probe #3 shows a -6 % tax the moment anything else shares the engine).
+
+The next instrument is a rocprofv3 trace of a 32K prefill: it would show the copy engine's busy fraction and,
+crucially, *where* its gaps sit (during resident runs? at layer boundaries? at chunk boundaries?).  That is a
+direct measurement, unlike the phase table's aggregate.
