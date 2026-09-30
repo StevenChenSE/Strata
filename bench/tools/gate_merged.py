@@ -23,8 +23,8 @@ import sys
 
 DATA = "/home/jianwei/Strata-data"
 ST = "/home/jianwei/Documents/Strata"
-OLD = f"{ST}/build-hip/strata-hip"
-MERGED = "/tmp/strata-rebase/build-merge/strata-hip"
+OLD = "/tmp/strata-hip-premarge"   # preserved pre-merge binary
+MERGED = f"{ST}/build-hip/strata-hip"   # after the merge, the canonical build IS the merged engine
 OUT = "/tmp/gate-merged"
 REPS = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 

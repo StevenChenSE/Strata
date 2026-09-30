@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # Launch Strata with the configuration measured on this box (ROCm gfx1100, PCIe 4.0 x16, 92 GiB RAM).
 #
+# The binary this points at is now the MERGED engine: upstream's AMD HIP backend (origin/main, engine 0.1.28,
+# merged into this branch as 2a59383) plus this port's kernels - our WMMA dense GEMMs and prompt attention, our
+# VRAM-doorbell verify handshake, the GDN sub-phases and the MMQ gather batching.  The defaults below were
+# measured on the pre-merge engine and re-checked on the merged one at 32K: prefill ~1137 against ~1032 tok/s and
+# decode ~57.6 against ~55.0, so they remain the right defaults.
+#
+# TWO known issues with the merged engine are recorded in
+# bench/results/2026-09-30-hip-gfx1100-speed/REBASE-UPSTREAM.md and are worth knowing before trusting a single
+# run: its expert placement occasionally differs between runs (served from cache versus lent to the CPU, and a
+# lent expert "rounds differently" per src/prefill/prefill.cpp), which can flip draft acceptance from 1.000 to
+# ~0.81 and cost ~9% decode; and the hipBLASLt tuning table does not engage on this ROCm, so the GEMM fallback is
+# hipblasGemmEx.  Setting PCIE_FRAC=0 removes the flip but costs 9% tg and 2.9% pp - a workaround, not a fix.
+#
 # The defaults below are not guesses; each is the winner of a measured comparison recorded in
 # bench/results/2026-09-30-hip-gfx1100-speed/README.md:
 #
@@ -11,7 +24,9 @@
 #                        at 32K/64K/128K/256K; 8x the context costs ~6 GiB of expert cache at fp16 KV.
 #   --spec 2             the draft length that wins at >=32K context (55.6 vs 52.1 for spec 4).  At short
 #                        context the optimum is 4 (47.1 vs 42.1), so override with SPEC=4 for short work.
-#   --pcie-frac 0.30     +10% decode at 1K with prefill unchanged, neutral at 32K, versus the 0.55 default.
+#   --pcie-frac 0.30     the measured optimum on the merged engine at 32K: pp 1136.6 and tg 57.6 against
+#                        1104.9 and 52.4 with 0 (see the note above), and +10% decode at 1K versus the 0.55
+#                        default on the pre-merge engine.
 #   --expert-cache auto  policy default; the capacity above is what sizes it.
 #
 # Usage:

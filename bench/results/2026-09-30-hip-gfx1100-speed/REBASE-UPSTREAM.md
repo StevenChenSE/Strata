@@ -491,3 +491,27 @@ frac 0 pins, while speed follows host conditions (PLE, arena load), which it doe
 `--pcie-frac 0.30` was the **fastest of the three on both axes** - prefill 1,136.6 against our 1,031.9 (+10 %) and
 decode 57.6 against our 55.0 (+4.7 %).  So when it does not flip it is the best build available; the remaining work
 is to remove the intermittent placement nondeterminism in code, not to work around it with a flag that costs 9 %.
+
+## The merge landed on hip-gfx1100
+
+Merged as commit **2a59383** - zero conflicts.  It takes 47 commits from the merged branch (upstream's backend plus
+the resolution in `dd51c89`) while keeping this branch's 14 bench commits.  The pre-merge binary is preserved at
+`/tmp/strata-hip-premarge` (24 MB), and `build-hip/` was reconfigured for the merged sources and rebuilt: 0 errors,
+and the binary's version string is now **0.1.28** where it was 0.1.23.
+
+Post-merge check on the canonical path - both binaries at the same flags (`--expert-cache auto --prefill 2048
+--spec 2 --pcie-frac 0.30 --adapt-every 2 --kv int8`), interleaved, 2 reps:
+
+| tier | merged (0.1.28) | pre-merge (0.1.23) |
+| --- | ---: | ---: |
+| 32K | **pp 1153.2, tg 56.0** | pp 1060.3, tg 54.5 |
+| 1K | pp 544.7, tg 41.4 | pp 518.3, tg 44.3 |
+
+At the decision tier the merge is **+8.8 % prefill and +2.8 % decode**.  The 1K tier is noise-dominated at two
+reps (pp favours the merge, tg the pre-merge) and should not be read as a result.  Both arms held 1.000 acceptance
+throughout - the intermittent placement flip did not appear in this session.
+
+Also updated: `tools/run-tuned.sh`'s header now records that the binary it launches is the merged engine, the two
+known issues (intermittent placement nondeterminism, and the hipBLASLt table not engaging on this ROCm), and why
+`--pcie-frac 0.30` rather than 0 is the default; `bench/tools/gate_merged.py` now points at the post-merge paths
+(`build-hip/strata-hip` for the merged engine, `/tmp/strata-hip-premarge` for the pre-merge one).
