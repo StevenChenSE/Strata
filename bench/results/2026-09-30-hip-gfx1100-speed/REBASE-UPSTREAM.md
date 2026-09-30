@@ -515,3 +515,53 @@ Also updated: `tools/run-tuned.sh`'s header now records that the binary it launc
 known issues (intermittent placement nondeterminism, and the hipBLASLt table not engaging on this ROCm), and why
 `--pcie-frac 0.30` rather than 0 is the default; `bench/tools/gate_merged.py` now points at the post-merge paths
 (`build-hip/strata-hip` for the merged engine, `/tmp/strata-hip-premarge` for the pre-merge one).
+
+## Three follow-ups: vision on HIP, --kv-resident, and the PLE read path (2026-10-01)
+
+### 1. Image support is feasible without porting anything
+
+The vision helper exists in-tree (`tools/vision/strata_vision.cpp` + its CMakeLists) and contains **zero** CUDA
+references: it is a thin llama.cpp `mtmd` wrapper that loads the model's mmproj, tokenizes an image, and *writes a
+file* - int32 `{0x31455653 'SVE1', n_tokens, nx, ny, n_embd}` followed by float32 rows. The engine's side
+(`generate.cpp:3558`, the GENI request path, and the m-RoPE `(t, h, w)` table at `generate.cpp:278/1448`) is
+architecture-neutral. The installer builds the helper with `-DSTRATA_VISION_CUDA=ON`, which only sets
+`GGML_CUDA=ON` inside the helper's llama.cpp build - with it off (the default) the encoder runs on the CPU.
+
+So the path for this deployment is: build `strata-vision` with `STRATA_VISION_CUDA=OFF` (a CPU encoder is fine for
+interactive image rates), later optionally add a `GGML_HIP` option to the helper's CMakeLists for GPU encoding.
+The engine needs no changes. **The blocker is an asset, not code**: the only mmproj on this box is the 27B one from
+the old llama.cpp setup; there is no vision encoder for Qwen3.8-Flash-Next (and no `<|image_pad|>` visible in the
+pack's vocab.json, though the engine's metadata pins `kImagePad = 248056` from `qwen4exp.ple.image_token_id`).
+Sourcing a matching mmproj is the remaining step before an end-to-end image test.
+
+### 2. `--kv-resident 32768` helps decode, and is now the service default
+
+`--kv-resident 0` (the default) keeps the *whole* KV in VRAM; `N` keeps only N cells per QSA layer (min 20480) and
+streams the rest from pinned host memory. Upstream's measured configuration passes 32768. Measured here, 32K prompt
+and 4K prompt, two interleaved repetitions each:
+
+| tier | kv-resident | pp | tg |
+| --- | --- | --- | --- |
+| 32K | 0 | 1203.6 / 1041.3 | 57.93 / 49.12 |
+| 32K | 32768 | 1175.1 / 982.8 | **61.29 / 60.62** |
+| 4K | 0 | 921.5 / 929.3 | 43.41 / 44.45 |
+| 4K | 32768 | 934.5 / 954.1 | 44.10 / 45.54 |
+
+Decode: +14 % at the median on 32K (61.0 vs 53.5) and +2 % at 4K; prefill unchanged within noise. The mechanism is
+visible in the expert cache: the streaming arm reports *more* slots (9245 vs 9217 at 32K, 17.54 vs 17.48 GiB) -
+freeing the KV's VRAM gives the cache room, and the hit-rate gain outweighs the PCIe cost of streaming the
+non-resident tail. The kv-resident arm was also the tighter pair (61.29/60.62, spread 0.7, against 57.93/49.12,
+spread 8.8 - the known host-side variance), though two repetitions is thin evidence for stability. Applied to the
+live service: `~/.config/strata/serve.json` now passes `--kv-resident 32768`, and `/metrics` reports
+`kv_resident: 32768`.
+
+### 3. Pinning the PLE table in RAM hurts - keep `--ple-io direct`
+
+`--ple-io mmap` (page-cached) against the default `direct` (unbuffered SSD), 32K prompt, two repetitions: mmap lost
+on both axes (pp 771.6/918.2 against 1170.2/1053.8; tg 49.32/53.77 against 57.55/58.24). The PLE *phase* itself is
+small either way (95-102 ms direct, 100-122 mmap), but the mmap run's whole prefill inflated - GPU timeline 42.4 s
+against 27.9 s in the paired run, with `embed+steps` jumping 13x (5042 ms against 372 ms). The mechanism: the PLE
+split is 27.5 GB, the box already holds a 47 GiB pinned expert arena plus ~63 GB RSS, so mapping the table into the
+page cache invites reclaim pressure that stalls host-side work everywhere else. The direct path reads exactly the
+rows it needs and never holds the table. Verdict: the default is already right; "pinning it completely" is not
+viable at this table size on this box.
