@@ -72,6 +72,18 @@ believing anything is done:
   debugger; use a finite value (default 20 s) otherwise.
 * A hang that ends inside the ROCm runtime cannot be interrupted from the host: if the engine is
   wedged, `pkill` it before the next run — do not assume it will exit on its own.
+* **Never benchmark while anything else is writing or computing.** A 5 GB download running alongside a 4K
+  prefill run moved it from 8,275-8,517 ms to 10,159 ms — a 20 % error, larger than most effects worth
+  measuring. Serialise heavy jobs; the box has 6 physical cores and the prompt path uses them.
+* **Do not trust a single run of the prompt path.** Same-configuration 4K runs spread over ~3 % normally, so
+  compare repeated runs (or read a phase table), and prefer an A/B switch that already exists
+  (`STRATA_PREFILL_RING`, `STRATA_GDN_REC_HEADS`, `--ple-io`, `--pcie-frac`) over one you have to add.
+* **Know the engine's non-determinism before writing an acceptance test.** The adaptive VRAM tier makes
+  timing-dependent swaps, different residency sends an expert down a different (CPU vs GPU) arithmetic
+  path, and the tokens diverge. "Identical token sequence" is only meaningful between runs whose
+  `adaptive tier N experts swapped` count agrees (measured: 3156 matches bit-exactly across the sync-removal
+  change; 5270 vs 5176 do not match). The 8-token seed run *is* bit-reproducible and is the cheap check.
+* **Don't benchmark while a download runs** (see above), and remember the CPU governor here is `powersave`.
 
 ## 4. Build & run (incremental, Unix Makefiles)
 
