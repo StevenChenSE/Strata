@@ -20,16 +20,16 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__))
-  #define STRATA_WMMA_GFX11
-#endif
-
-#if defined(STRATA_WMMA_GFX11) || !defined(__HIP_DEVICE_COMPILE__)
+// STRATA_WMMA_GFX11 is defined by the BUILD (CMakeLists.txt, from CMAKE_HIP_ARCHITECTURES), not inferred
+// from compiler macros: measured on this toolchain the HOST pass of a HIP compile does not define
+// __gfx1100__ but does define __HIP_DEVICE_COMPILE__, so a compiler-macro guard here silently selected the
+// "return false" stub at the bottom of this file for the very symbol the engine links - the WMMA path then
+// never ran, while the same file compiled with hipcc (as the probes do) took the real branch.  One
+// build-defined macro is uniform across the host and device passes.
+#if defined(STRATA_WMMA_GFX11)
 
 using v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
 using v8fp32 = float __attribute__((ext_vector_type(8)));
-
-#if defined(STRATA_WMMA_GFX11)
 
 // ===========================================================================
 // Variant 1: 16x16_1w - Single-wave kernel for small T / N.
@@ -202,12 +202,6 @@ __global__ void gemm_wmma_64x64_4w(
     store_acc(c_acc2, n_tile + 32);
     store_acc(c_acc3, n_tile + 48);
 }
-
-#else
-// Non-gfx1100 device pass: empty stubs for symbol parity
-__global__ void gemm_wmma_16x16_1w(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float) {}
-__global__ void gemm_wmma_64x64_4w(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float) {}
-#endif
 
 bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
                           int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,

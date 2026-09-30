@@ -326,5 +326,33 @@
     "prefill_ms": 62860.4,
     "decode_tok_s": 22.85,
     "note": "short decode after a 32K prefill - cache still cold, not comparable to the 256-token row"
+  },
+  {
+    "model": "IQ3_S",
+    "max_new": 1,
+    "exit": 0,
+    "spec": "2",
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "1k-wmma-live",
+    "prompt_tokens": 1023,
+    "prefill_ms": 2832.9,
+    "prefill_tok_s": 361.11,
+    "note": "median of 3 interleaved pairs; median no-WMMA 3271.8 ms (312.7 tok/s) -> -13.4%"
+  },
+  {
+    "model": "IQ3_S",
+    "max_new": 1,
+    "exit": 0,
+    "spec": "2",
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "4k-wmma-live",
+    "prompt_tokens": 4095,
+    "prefill_ms": 7069.2,
+    "prefill_tok_s": 579.27,
+    "note": "no-WMMA 7621.1 ms (537.3 tok/s) -> -7.2%"
   }
 ]

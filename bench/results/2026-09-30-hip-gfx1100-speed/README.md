@@ -835,3 +835,42 @@ inflates the sum.  A 2x faster kernel for that component moves the wall clock by
 small and the dense GEMMs are not on the prefill's critical path.  Kept enabled because it is correct, never
 slower, HIP-only with a fallback, and a foundation for a fused dequant+WMMA variant; the probe is preserved
 at `bench/tools/`.
+
+## Round 21: the WMMA GEMM was silently compiled out - after fixing that it is worth 7-13% pp
+
+Round 20 concluded "correct and 2x faster in isolation, but NEUTRAL end-to-end".  That was a false negative:
+a rocprofv3 kernel trace showed **zero `gemm_wmma` kernels** in a 1K prefill, and the object's symbol was
+**3 bytes with no undefined references** - the `return false` stub.  A temporary probe print in the dispatch
+showed `eligible=1 used=0` for every call: the arguments were fine, the *implementation* was missing.
+
+Root cause, measured with the exact build flags (host vs device pass of `clang++ -x hip`):
+
+| pass | `__gfx1100__` | `__HIP_DEVICE_COMPILE__` | `STRATA_WMMA_GFX11` |
+| --- | --- | --- | --- |
+| **host** (emits the symbol the engine links) | **absent** | defined | **undefined** |
+| device | defined | defined | defined |
+
+`wmma_gemm.cu`'s guard was `#if defined(__HIPCC__) && (defined(__gfx1100__) || ...)` and the outer guard was
+`#if defined(STRATA_WMMA_GFX11) || !defined(__HIP_DEVICE_COMPILE__)`, so on this toolchain the host pass took
+the `#else` stub.  The probes worked because **hipcc** (not the build's direct `clang++` invocation) defines
+the arch macro in both passes - i.e. the probes were testing a different compilation of the same file.
+
+Fix: define the arch macro from the build (`CMakeLists.txt`, `target_compile_definitions(strata_prefill_hip
+PRIVATE STRATA_WMMA_GFX11=1)` when `CMAKE_HIP_ARCHITECTURES` matches `gfx11`), and reduce the file to a single
+`#if defined(STRATA_WMMA_GFX11)` with the stub as the only fallback, so a non-gfx11 build returns false and
+can never silently launch empty kernels.  Verified: the symbol is now 413 bytes, the binary contains the four
+`gemm_wmma` symbols, and the A/B finally measures the real thing:
+
+| tier | WMMA | `STRATA_WMMA_GEMM=0` | gain |
+| --- | ---: | ---: | ---: |
+| 1K, 3 interleaved pairs (medians) | **2,832.9 ms (361.1 tok/s)** | 3,271.8 ms (312.7 tok/s) | **-13.4 %** |
+| 4K | **7,069.2 ms (579.3 tok/s)** | 7,621.1 ms (537.3 tok/s) | **-7.2 %** |
+
+The WMMA arm is also far steadier (2,828.8 / 2,870.6 / 2,832.9 ms, +-0.7 %) than the rocBLAS arm
+(3,029 / 3,272 / 4,312 ms).  The 8-token seed run still reproduces the pre-change tokens exactly, so the
+change is numerically faithful in practice.
+
+**Lesson (third time this session): a "no effect" result must be validated before it is believed.** Round 18
+over-trusted arithmetic, Round 20 over-trusted a kernel-level speedup, and both times the missing step was
+confirming that the code under test actually ran.  Here the check is cheap: trace for the kernel symbol, or
+assert the linked function's size/references.

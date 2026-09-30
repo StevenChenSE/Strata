@@ -693,6 +693,15 @@ if(STRATA_ENABLE_HIP)
 
   add_library(strata_prefill_hip STATIC src/prefill/gemm.cu src/prefill/wmma_gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   set_source_files_properties(src/prefill/gemm.cu src/prefill/wmma_gemm.cu src/prefill/kernels.cu PROPERTIES LANGUAGE HIP)
+  # RDNA3 matrix instructions (v_wmma_*) only exist on gfx11, and the arch macro cannot be inferred from the
+  # compiler here: measured on this toolchain the HOST pass of a HIP compile does not define __gfx1100__ but
+  # does define __HIP_DEVICE_COMPILE__, so a compiler-macro guard in wmma_gemm.cu silently compiled its
+  # "return false" stub for the host symbol the engine links (the WMMA path never ran; the same file built
+  # with hipcc, as the probes do, took the real branch).  Define it from the build so it is uniform across the
+  # host and device passes, and only when the configured arch really is gfx11.
+  if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx11")
+    target_compile_definitions(strata_prefill_hip PRIVATE STRATA_WMMA_GFX11=1)
+  endif()
   target_include_directories(strata_prefill_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # leaving STRATA_PREFILL_MMQ undefined compiles prefill.cpp's built()-false stub set; the
   # real MMQ path arrives with strata_mmq built from llama.cpp's GGML_HIP sources (phase 2)
