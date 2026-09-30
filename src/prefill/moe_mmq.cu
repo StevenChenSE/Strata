@@ -7,6 +7,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -35,6 +36,50 @@ __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const ui
     if (i < na) ab_dst[i] = a[i];
     else if (i < na + nb) ab_dst[i] = b[i - na];
     else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
+}
+
+struct ExpertBlobs {
+    const void* ptrs[16];
+};
+
+__global__ void copy16_batch_kernel(ExpertBlobs blobs, int n, size_t up_off, size_t down_off,
+                                    int64_t na, int64_t nc,
+                                    uint4* __restrict__ gu_dst, uint4* __restrict__ d_dst) {
+    const int e = blockIdx.y;
+    if (e >= n) return;
+    const uint8_t* blob = (const uint8_t*) blobs.ptrs[e];
+    if (!blob) return;
+
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const uint4* a = (const uint4*) blob;
+    const uint4* b = (const uint4*) (blob + up_off);
+    const uint4* c = (const uint4*) (blob + down_off);
+    uint4* ab_dst = gu_dst + (int64_t) e * (2 * na);
+    uint4* c_dst = d_dst + (int64_t) e * nc;
+
+    if (i < na) ab_dst[i] = a[i];
+    else if (i < 2 * na) ab_dst[i] = b[i - na];
+    else if (i < 2 * na + nc) c_dst[i - 2 * na] = c[i - 2 * na];
+}
+
+__global__ void copy1_batch_kernel(ExpertBlobs blobs, int n, size_t up_off, size_t down_off,
+                                   int64_t na, int64_t nc,
+                                   uint8_t* __restrict__ gu_dst, uint8_t* __restrict__ d_dst) {
+    const int e = blockIdx.y;
+    if (e >= n) return;
+    const uint8_t* blob = (const uint8_t*) blobs.ptrs[e];
+    if (!blob) return;
+
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const uint8_t* a = blob;
+    const uint8_t* b = blob + up_off;
+    const uint8_t* c = blob + down_off;
+    uint8_t* ab_dst = gu_dst + (int64_t) e * (2 * na);
+    uint8_t* c_dst = d_dst + (int64_t) e * nc;
+
+    if (i < na) ab_dst[i] = a[i];
+    else if (i < 2 * na) ab_dst[i] = b[i - na];
+    else if (i < 2 * na + nc) c_dst[i - 2 * na] = c[i - 2 * na];
 }
 
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales
@@ -163,6 +208,41 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
                                                          (uint8_t*) gu_dst, (const uint8_t*) down, nc, (uint8_t*) d_dst);
     }
     ck(cudaGetLastError(), "gather_native");
+}
+
+void gather_native_batch(const void* const* blobs, int n, size_t up_off, size_t down_off,
+                         size_t gu_half_bytes, size_t d_bytes, void* gu_dst, void* d_dst, void* stream) {
+    if (n <= 0 || (gu_half_bytes == 0 && d_bytes == 0)) return;
+    const cudaStream_t s = (cudaStream_t) stream;
+    for (int b = 0; b < n; b += 16) {
+        const int cur_n = std::min(16, n - b);
+        ExpertBlobs eb{};
+        for (int i = 0; i < cur_n; ++i) eb.ptrs[i] = blobs[b + i];
+        void* cur_gu_dst = (uint8_t*) gu_dst + (size_t) b * (2 * gu_half_bytes);
+        void* cur_d_dst = (uint8_t*) d_dst + (size_t) b * d_bytes;
+
+        bool a16 = ((uintptr_t) cur_gu_dst | (uintptr_t) cur_d_dst | gu_half_bytes | d_bytes | up_off | down_off) % 16 == 0;
+        if (a16) {
+            for (int i = 0; i < cur_n; ++i) {
+                if (((uintptr_t) eb.ptrs[i]) % 16 != 0) {
+                    a16 = false;
+                    break;
+                }
+            }
+        }
+        if (a16) {
+            const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
+            dim3 grid(blocks(2 * na + nc), (unsigned) cur_n);
+            copy16_batch_kernel<<<grid, 256, 0, s>>>(eb, cur_n, up_off, down_off, na, nc,
+                                                    (uint4*) cur_gu_dst, (uint4*) cur_d_dst);
+        } else {
+            const int64_t na = (int64_t) gu_half_bytes, nc = (int64_t) d_bytes;
+            dim3 grid(blocks(2 * na + nc), (unsigned) cur_n);
+            copy1_batch_kernel<<<grid, 256, 0, s>>>(eb, cur_n, up_off, down_off, na, nc,
+                                                   (uint8_t*) cur_gu_dst, (uint8_t*) cur_d_dst);
+        }
+        ck(cudaGetLastError(), "gather_native_batch");
+    }
 }
 
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {

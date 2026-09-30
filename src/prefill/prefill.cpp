@@ -52,9 +52,15 @@ Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
 void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
+void gather_native_batch(const void* const*, int, size_t, size_t, size_t, size_t, void*, void*, void*) {}
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
+}  // namespace strata::prefill::mmq
+#else
+namespace strata::prefill::mmq {
+void gather_native_batch(const void* const* blobs, int n, size_t up_off, size_t down_off,
+                         size_t gu_half_bytes, size_t d_bytes, void* gu_dst, void* d_dst, void* stream);
 }  // namespace strata::prefill::mmq
 #endif
 
@@ -92,6 +98,11 @@ inline int ring_slots(size_t T) {
     return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+
+inline bool is_mmq_gather_per_expert() {
+    const char* v = std::getenv("STRATA_MMQ_GATHER");
+    return v != nullptr && std::strcmp(v, "per_expert") == 0;
+}
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -1403,21 +1414,44 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
+                    const bool per_expert = is_mmq_gather_per_expert() || (!stream_all && m.src != nullptr && m.ring < MMQ_GROUP);
+                    const uint8_t* grp_blobs[MMQ_GROUP] = {};
+                    int grp_slots[MMQ_GROUP] = {};
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                         const int32_t e = order[j];
-                        pt.mark(kPfDequant, cs);
                         if (use_mmq) {
-                            // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                             const size_t q = j % MMQ_GROUP;
-                            if (lay.native) {
-                                const auto& f = lay.fmt[(size_t) l];
-                                mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
-                                                   mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                            if (per_expert) {
+                                pt.mark(kPfDequant, cs);
+                                if (lay.native) {
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
+                                                       mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                } else {
+                                    mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                }
+                                if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
+                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                             } else {
-                                mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                grp_blobs[q] = blob_dev;
+                                grp_slots[q] = slot;
+                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                pt.mark(kPfDequant, cs);
+                                const int ngx = (int) (q + 1);
+                                if (lay.native) {
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    mmq::gather_native_batch((const void* const*) grp_blobs, ngx, f.up_off, f.down_off,
+                                                             mmq_gub / 2, mmq_db, m.grp_gu, m.grp_d, m.cs);
+                                } else {
+                                    for (int i = 0; i < ngx; ++i) {
+                                        mmq::gather_strata_q2(grp_blobs[i], m.grp_gu + (size_t) i * mmq_gub,
+                                                              m.grp_d + (size_t) i * mmq_db, m.cs);
+                                    }
+                                }
+                                for (int i = 0; i < ngx; ++i) {
+                                    if (grp_slots[i] >= 0) cudaEventRecord(m.used[grp_slots[i]], m.cs);
+                                }
                             }
-                            if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
-                            if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                             // the group's products: gate/up, swiglu, the group's H to q8_1, down
                             const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
                             const int ngx = (int) (q + 1);
