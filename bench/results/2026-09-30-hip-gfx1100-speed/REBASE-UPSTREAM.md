@@ -206,3 +206,43 @@ irrelevant to a run.
 draft-stop threshold is the place to look - `--spec-min-p` (0.5 here) and any changed stopping rule in their
 `mtp.cpp` (the merge added 21 lines there).  A one-flag test at a lower `--spec-min-p` should say whether the
 drafting recovers; if it does, the deficit is a configuration difference rather than a regression.
+
+## Pursuing the tg difference: no fixable deficit - it is parity with wider variance
+
+The -5 to -8 % tg was pursued through every configuration lever that could plausibly matter.  None of them changes
+it, and the best case turns out to be parity.
+
+**Corrected decode accounting.**  The earlier "1.80 vs 1.29 tokens/round" came from `--max-new 8` runs, i.e. 5-7
+rounds - far too small a sample, and it is withdrawn.  Re-derived from the 128-token gate logs, which are the same
+session and interleaved (medians of 3):
+
+| 4K, 128 tokens | rounds | acceptance | tokens/round | wait for rings | CPU pool | per-round | ms/token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| old | 55 | 0.745 | 2.38 | 26.2 | 16.8 | 43.0 | 18.1 |
+| merged | 60 | **0.773** | 2.13 | 27.3 | 15.0 | 42.3 | 19.9 |
+
+Acceptance is equal (merged marginally higher), the per-round cost is equal, and merged's drafting is *cheaper* -
+0.875 against 1.758 ms/round, with the MTP prompt cost down from 155.1 ms to 11.8 ms.  Only tokens/round differs,
+by ~10 %, with fully overlapping ranges.
+
+**Levers tested and rejected**, all on the merged build at 4K/128 tokens, interleaved, order rotated per repetition
+(the rotation matters: the first sweep of this session ran a fixed order and showed a spurious pp anomaly):
+
+| lever | result |
+| --- | --- |
+| `--spec-min-p` 0.0 / 0.2 / 0.5 / 0.8 | lower thresholds *do* raise tokens/round (2.71 at 0.2, 2.67 at 0.0, against 2.11 at 0.5) but tg gets **worse** (42.5 / 42.0 against 43.7) - the extra drafts are rejected, so the per-round cost wins.  0.5 stays. |
+| `--pcie-frac` 0.05 / 0.15 / 0.30 | all within noise (43.6 / 44.7 / 43.9).  A 2-rep sweep had suggested 0.15 at 50.3; that was under-sampling. |
+| `--adapt-every 0` (upstream's documented setting) | much worse: 34.1 tok/s, the CPU pool grows to 36.3 ms/round and becomes the bottleneck. |
+| cache shrink from their 0.1.28 draft-head reservation | 46 slots (9,293 -> 9,247; 17.63 -> 17.54 GiB).  Too small to matter. |
+| `--spec` 2 / 3 / 4 / 6 | **4 remains optimal at 48.0 tok/s**, equal to the old binary's 48.1 - and 953 pp against 823. |
+
+**Conclusion.**  There is no systematic tg deficit to fix.  Across ~6 independent measurements the old binary is
+consistently ~47.4-48.4 while the merged build ranges 43.6-48.0, so the merged engine's *median* is a few per cent
+lower but its spread is much wider; in its best case it is exactly at parity, and its optimum `--spec` is
+unchanged.  What the merge certainly brings is a large prefill win (+4 to +18 %, and 953 against 823 pp in the
+`--spec 4` run), a 13x cheaper MTP prompt (155.1 -> 11.8 ms), and upstream's six releases of engine work.
+
+**Recommendation.**  Adopt the merge: it is at least at par on decode and substantially better on prefill.  The
+one reservation is *consistency*, not speed - the pre-merge binary's decode is tighter (47.4-48.4 against
+43.6-48.0), which matters for latency-sensitive serving and is the thread to pull if the merged build becomes the
+default.  The worktree branch `rebase-test` (`dd51c89`) is where it lives.
