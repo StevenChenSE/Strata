@@ -1803,3 +1803,36 @@ It also corrects the comparison basis used earlier in this file.  The dot-instru
 26.3 TOPS, not the ~123 TOPS int8 figure quoted for the part, so the engine was **63 % of the right ceiling all
 along** - not 13 % of the wrong one - and the "apparent 10x headroom" that motivated looking here was an artefact
 of comparing against a number this instruction cannot reach.
+
+## Correction: the ring A/B was a no-op, the ring DOES matter, and the default is its optimum
+
+Earlier entries recorded that "a deeper copy ring is not the lever" and that `STRATA_PREFILL_RING=384` was
+"worse, and the gap metric is itself noisy, so the test is inconclusive".  Both were wrong for a simple reason:
+`ring_slots()` returns 384 when `g_pinned_share >= 0.9` else 96, and the engine sets that share from
+`pinned / total` for the expert arena - which is fully pinned (46.84 GiB) - so **the default is already 384**.
+Comparing the default against an explicit 384 therefore ran the *same configuration twice*, and the differences
+I measured were pure noise.
+
+Re-run against a genuinely shallower ring, 5 runs each, 4K:
+
+| ring | runs (ms) | median | tok/s |
+| --- | --- | ---: | ---: |
+| 96 | 6,152.2, 5,941.7, 6,788.8, 6,973.8, 5,925.0 | 6,152 | 666 |
+| **default (384)** | 5,750.5, 5,788.5, 5,824.5, 5,793.1, 6,458.1 | **5,793** | **707** |
+
+So the ring **is** a lever, worth **+6.2 %** from 96 to 384 - which also means the 33 % `wait copy` phase is
+partly ring-limited after all, contrary to my reasoning that a 58 ms buffer must cover 26 ms gaps.
+
+And the default is already its optimum.  At the knob's ceiling (`RING_MAX = 512`), 5 runs each:
+
+| ring | median | streamed | resident |
+| --- | ---: | --- | --- |
+| default (384) | **5,908 ms (693 tok/s)** | 26,679-26,765 | 16,224-16,268 |
+| 512 | 5,938 ms (690 tok/s) | 26,996-27,050 (+1.2 %) | 15,901-15,954 (**-2.1 %**) |
+
+Neutral in time, and it does cost expert-cache residency - so the cache trade-off the code comment mentions is
+real, just small, and 384 is the right setting.
+
+**Consequences.**  The performance numbers in this file all used the default, so they stand unchanged.  What
+changes is the claim that the ring is not a lever and that the fix direction left for `wait copy` is only the
+copy-supply decoupling: the cheap part of that lever is already taken, at +6.2 %.
