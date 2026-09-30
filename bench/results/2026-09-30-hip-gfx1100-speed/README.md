@@ -2205,3 +2205,25 @@ total, 4.85 s prefill, 2.53 s decode).  A 12-run interleaved sweep is therefore 
 loading.  Upstream's own docs avoid this by driving a persistent `--serve` engine.  With one GPU and per-arm flags,
 each arm switch costs a load, so the interleaved design inherently pays arms x reps loads; a server reduces the
 per-request cost from ~30 s to ~7 s (~2.4x on the same design) and only between-arm restarts remain.
+
+## Rebase feasibility: yes, bounded - see REBASE-UPSTREAM.md
+
+Investigated whether our branch can be rebased onto upstream's merged gfx1100 backend (origin/main, engine 0.1.28;
+our base is 0.1.22, so a rebase also picks up six releases of engine work).  Measured, not estimated:
+
+* our divergence is **22 code commits / 26 files / +1,964-88** (the other 61 commits are this bench record);
+* a merge in a throwaway worktree auto-merges **35 files** and conflicts in **11 files, 18 hunks total**;
+* **14 of our commits touch those 11 files**, so a plain `git rebase origin/main` would stop ~14 times
+  re-resolving the same regions - squash our code work into a few patches, or merge once;
+* the merged tree **configures cleanly** with both backends present, then **fails to build (17 errors)** for one
+  reason: the two ports each bring their own CUDA-to-HIP compat layer (`compat/hip/*` ours,
+  `include/strata/hip_compat/*` theirs) and they define the same primitives incompatibly - their `intrinsics.hpp`
+  has `__vsubss4` as a macro, ours as an inline function, so our declaration is macro-expanded into nonsense
+  (`device.cu:4`), plus duplicate `cudaGraphInstantiate`/`cudaFuncSetAttribute`;
+* dropping one shim resolves it, and theirs is the one to keep: our shim's unique content is superseded - they do
+  not define `__nanosleep` at all (our underflow bug was ours alone), they have the same `__vsubss4`/`__vsub4`
+  emulations, and their performance doc independently records the same `__fmul_rn` contraction finding.
+
+So the work is a bounded port of our value-add (WMMA GEMM + WMMA attention + prefill instrumentation + MMQ gather
+batching + the launcher/bench record) onto their backend, not a ground-up merge.  Full detail, tables and the
+recommended path: [REBASE-UPSTREAM.md](REBASE-UPSTREAM.md).
