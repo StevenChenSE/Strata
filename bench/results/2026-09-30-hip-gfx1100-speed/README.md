@@ -1370,3 +1370,33 @@ Round 21 WMMA-attention numbers (6,045 vs 6,611 ms, +9.4 %), which are *inside* 
 is the *within-run phase evidence*, where the same change moved `qsa attn` from 1,115 ms to 201 ms (a 5.5x
 change, and the phase shares are computed against the run's own total).  1K comparisons are unaffected: the
 WMMA arms there held within 1.4 %.
+
+## Round 32: a quantitative decode cost model - tg is bound by CPU expert bytes, not attention
+
+The engine's own `STRATA_VERIFY_PROFILE=1` gives a per-round breakdown, and it fits a simple model.  At 1K:
+
+    verify window   wait for rings 34.517  pool 33.580  host 1.075  commit 2.683 ms/round
+                    CPU experts 8.99 distinct / 12.43 routed per layer
+    pool multi      gate/up 20.352  quantize 0.078  down 12.436 ms/round; 27.0 GB/s; CPU pool call 33.511
+    dispatch        plan 0.201  activation quantize 0.331  jobs 0.101  run 32.872 ms/round
+    pcie experts    3.22 distinct experts per layer read over PCIe (share 77/256 of the misses)
+    mtp             4.099 ms/round drafting
+
+and at 32K the same lines read 61.367 / 60.579 / 59.621 / 60.482 ms with **16.25 distinct of 24.15 routed
+per layer**.  The model is just the bytes:
+
+| tier | distinct CPU experts/layer | bytes/round (x 48 layers x 2,046,400 B) | at the pool's 27 GB/s | profile's pool |
+| --- | ---: | ---: | ---: | ---: |
+| 1K | 8.99 | 883 MB | 32.7 ms | 33.6 ms |
+| 32K | 16.25 | 1,596 MB | 59.1 ms | 60.6 ms |
+
+agreement within 3 %.  So **decode throughput is bound by the CPU expert path's memory bandwidth**, and the
+1K -> 32K slowdown is *routing breadth* (a longer context routes each token to more distinct experts: 8.99 ->
+16.25 distinct per layer, +81 %), not attention and not KV size.  The pool itself is 5 workers + the host thread
+on this 6-core/12-thread box - every physical core - and its header documents 36.32 GB/s standalone against the
+27 GB/s achieved in-engine, so it is already near the machine's memory bandwidth.
+
+That reframes the tg@32K gap (37.87 vs 49.0 tok/s): the extra ~27 ms/round is expert *bytes*, so the lever is
+tier policy (keep the hot set resident), not kernel work on the attention.  Note also that the profiled items
+sum to ~41 ms of an ~81 ms round at 1K, i.e. **~39 ms/round of the decode is in the draft/sampling path**, which
+the profile does not label - a second, unexamined target.
