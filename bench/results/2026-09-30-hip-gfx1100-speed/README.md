@@ -1949,3 +1949,42 @@ and would not fit, but its **2.3 GB working set would**, and pinning that turns 
 fast-but-fragile into fast-and-stable (48 GiB arena + 2.3 GiB = ~50 of 92 GiB).  Nothing in the engine prefaults
 or locks those pages today.  The default `direct` path stays the robust choice; the variance itself lives in
 other processes' I/O, not ours.
+
+## Tuning for the x16 link: `--pcie-frac 0.30`, ring unchanged
+
+Both remaining knobs were swept with every configuration measured *interleaved* within each repetition, so
+host-side interference cannot masquerade as a configuration effect.  Scripts: `bench/tools/tune_x16.py`,
+`tune_x16_confirm.py`, `tune_32k.py`, `tune_x16_round2.py`.
+
+**`--pcie-frac`** (the share of each layer's missed experts the GPU fetches over PCIe instead of the CPU
+computing them; a static model default of 0.55).  At 1K, interleaved x5, 128-token decode:
+
+| frac | pp median | tg median (range) |
+| ---: | ---: | ---: |
+| **0.30** | 585.6 | **52.2** (50.2-52.9) |
+| 0.55 (default) | 576.0 | 47.3 (45.6-48.8) |
+| 0.70 | 593.0 | 45.4 (45.1-45.5) |
+
+so **0.30 is worth +10 % decode at 1K with the prefill unaffected** (an earlier reading of "-18 % pp" was noise;
+the pp medians are flat and their ranges overlap).
+
+At 32K, with a *fixed* 64-token protocol (the 32-token protocol is warm-up dominated and made two earlier sweeps
+contradict each other), interleaved x3:
+
+| frac | pp median (range) | tg median (range) |
+| ---: | ---: | ---: |
+| 0.00 | 1124.3 (1066-1154) | 49.8 (45.6-54.8) |
+| 0.15 | 1050.6 (1045-1170) | 53.5 (43.4-53.7) |
+| **0.30** | 1111.1 (1107-1156) | **55.0** (51.0-55.2) |
+| 0.55 (default) | 1141.4 (1126-1196) | 54.4 (54.0-55.2) |
+
+0.30 and 0.55 are statistically tied here (the 2.7 % pp edge to 0.55 is inside the spread) and the extremes are
+genuinely worse.  So **0.30 is the right global setting**: a clear 1K win, neutral at 32K.
+
+**`STRATA_PREFILL_RING`** is no longer a lever: at 4K over 8 interleaved reps, 384 gives 924.9 ms and 512 gives
+909.5 - inside the noise - and at 32K 384 is best on prefill (1058.6 ms, range 1037-1064).  The x8 tuning's +6.2 %
+belonged to the slow link; with `wait copy` down to 378 ms the buffer depth no longer binds.  **Keep the default.**
+
+**Tuned configuration:** `--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --adapt-every 2
+--pcie-frac 0.30 --mtp <rt>` - worth about +10 % decode at 1K over the default on this link, with prefill
+unchanged at 1K and within noise at 32K.
