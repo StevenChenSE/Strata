@@ -665,3 +665,26 @@ So even a chunked-smem GR kernel (which would remove the fallback cost) would le
 parity (43.00 -> ~48 tok/s at 96 - 10 = 86 ms/round = 20.7 ms/token vs 20.4 for window 6).  **`--spec 4`
 stays optimal**, and the value of the fix is that `--spec >= 5` no longer segfaults: the window is now
 bounded by the engine's own `kVerifyMaxT = 8` with a diagnostic instead of a core dump.
+
+## Round 16: `--adapt-every 2` is a replicated ~3 % tg win
+
+The adaptive VRAM tier swaps experts every 4 rounds by default.  Halving that was tested with pairs
+interleaved in time, and after the first (order-confounded) batch the order was reversed to balance the
+design.  All five pairs favour the shorter cadence:
+
+| pair | order | base | `--adapt-every 2` | delta |
+| --- | --- | ---: | ---: | ---: |
+| 1 | base first | 48.48 | 48.40 | -0.08 |
+| 2 | base first | 47.45 | 48.76 | +1.31 |
+| 3 | base first | 46.59 | 49.53 | +2.94 |
+| 4 | **adapt2 first** | 47.77 | 49.36 | +1.59 |
+| 5 | **adapt2 first** | 48.31 | 50.15 | +1.84 |
+| **mean** | | **47.72** | **49.24** | **+1.52 (+3.2 %)** |
+
+The base arm's apparent downward drift (48.48 -> 46.59) is why the first batch alone was not trustworthy;
+reversing the order in pairs 4-5 removes the sequencing explanation and the effect survives.
+
+Recommended configuration is therefore
+`--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --adapt-every 2 --mtp <rt>`, at
+**49.2-50.2 tok/s decode** against the CUDA counterpart's 50.5 (97-99 % of it), with pp unchanged
+(334 tok/s at 1K).

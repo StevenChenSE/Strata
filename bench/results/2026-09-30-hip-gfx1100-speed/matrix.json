@@ -265,5 +265,22 @@
     "spec_accept": 0.856,
     "vram_slots": 5341,
     "cache": "4096"
+  },
+  {
+    "run": "1k-real-mtp-adapt2",
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "spec": "4",
+    "spec_min_p": 0.5,
+    "mtp": "q2_0",
+    "prefill_chunk": 2048,
+    "cache": "auto",
+    "adapt_every": 2,
+    "prefill_tok_s": 334.47,
+    "decode_tok_s": 49.24,
+    "note": "mean of 5 interleaved pairs; +3.2% over adapt-every 4",
+    "prompt": "real C++ via bench/tools/tok_ascii.py"
   }
 ]
