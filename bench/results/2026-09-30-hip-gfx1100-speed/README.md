@@ -941,3 +941,32 @@ removing it is still the right idea.  What does not survive: the suggestion that
 the phase.  Expected gain from deleting the gather is on the order of its own cost, and the phase's dominant
 idle needs a finer instrument (a per-launch or copy-arrival timeline) to attribute before anyone spends effort
 on it.
+
+## Round 22: GDN split into sub-phases - the recurrence is NOT a lever, but the bf16 GEMMs are the biggest and most variable phase
+
+Added four sub-phase marks inside the GDN branch (`gdn gates`, `gdn conv`, `gdn rec`, `gdn out`) so the largest
+table entry stops being a black box.  A 4K run:
+
+| sub-phase | ms | share |
+| --- | ---: | ---: |
+| gdn (qkv/gate/alpha/beta projections) | 580 | 6.3 % |
+| gdn out (ssm_out projection) | 202 | 2.2 % |
+| **gdn rec** (the sequential scan) | **228** | **2.5 %** |
+| gdn conv | 20 | 0.2 % |
+| gdn gates | 2 | 0.0 % |
+| **GDN family total** | **1,032** | **11.3 %** |
+
+Two conclusions:
+
+* **The GDN recurrence is not a lever** - 228 ms at 4K, and its kernel is a modest 192-block x 128-thread loop
+  (Round 6).  That closes the question opened there.  The GDN family is 11.3 %, not the 21.6 % the single
+  `gdn` entry suggested, because the mark previously absorbed everything up to the next phase's mark.
+* **The projections are the GDN cost** (782 ms = 8.5 %), and they are exactly the `native_proj`/`bf16_proj`
+  calls the WMMA work covers.
+
+And the run exposed something more useful: **`hc read` - the six bf16 GEMMs per layer - is now the largest and
+by far the most variable phase**, 1,921 ms (20.8 %) here against 892-990 ms (11.6 %) in earlier 4K runs, with
+the same configuration.  That variance is the rocBLAS bf16 path behaving like the rocBLAS fp16 path did (the
+1K A/B showed the rocBLAS arm swinging 3,029-4,312 ms while the WMMA arm held within 0.7 %), so the delegated
+BF16 WMMA variant should both speed this phase up and stabilise it - and stabilising it may matter as much as
+its average cost, since it is what moves whole-run prompt throughput between 7.6 s and 9.2 s.
