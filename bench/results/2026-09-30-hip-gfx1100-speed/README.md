@@ -1124,3 +1124,43 @@ stated objective, but the artifact should be re-baselined rather than treated as
 architecture setting.  On this repo (gfx1100 only) that is harmless, and the device code does emit real
 `v_wmma_f32_16x16x16_f16` instructions, but on a non-gfx11 HIP target it would try to compile gfx11 intrinsics
 rather than fall back.  It should be moved behind the same build-provided define the prefill targets use.
+
+## Round 26: the WMMA prompt attention lands - pp@1K reaches the CUDA counterpart (408-420 vs 419 tok/s)
+
+`workflow-17` replaced the emulated `mma16816` inner loop of the batched prompt attention with real
+`v_wmma_f32_16x16x16_f16_w32` (scores GEMM as 16x32 across two waves, output GEMM as 4 warps x 64 dims), keeping
+the emulation as the non-gfx11 fallback and the A/B arm (`STRATA_PA_WMMA=0`; `STRATA_PROMPT_ATTN_OLD=1` still
+selects the per-token path).  Verified, not taken on trust:
+
+* the unbundled gfx1100 code object contains `v_wmma_f32_16x16x16_f16` instructions;
+* `qsa_prompt_attn_parity_hip`: **FAILURES 0**, and the phase-level speedups are 3-5x per case (int8 ctx 4096
+  5.17 ms vs 19.20 old / 22.90 emulated; fp16 6.44 vs 19.00 / 31.16; ctx 1500 2.54-2.75 vs 11.5-12.6 / 11.7);
+* its own FP64 error (3.65-4.96e-06) is the same order as the emulated path's (2.68-5.19e-06), so it is not a
+  precision regression.
+
+**In the engine (4K):**
+
+| | before | after |
+| --- | ---: | ---: |
+| GPU timeline | 6,913-7,118 ms | **5,929 ms** |
+| `qsa attn` phase | 1,115 ms (15.7 %) | **201 ms (3.4 %)** |
+
+**End-to-end A/B:**
+
+| tier | WMMA attention | emulated | note |
+| --- | ---: | ---: | --- |
+| 4K | **6,045.0 ms (677.4 tok/s)** | 6,610.8 ms (619.4) | +9.4 %, one pair |
+| 1K, 3 interleaved pairs | **2,507 / 2,438 / 2,451 ms (408.0 / 419.6 / 417.3)** | 2,595 / 3,057 / 2,784 ms (394.2 / 334.7 / 367.5) | WMMA wins all three |
+
+The first single 1K pair showed the opposite sign (2,842 vs 2,557 ms), which is why the repeat mattered: the
+emulated arm swings +-10 % run to run while the WMMA arm holds +-1.4 %, the same stability difference the GEMM
+work showed.  **pp@1K is now 408-420 tok/s against the CUDA counterpart's 419 (97-100 %), and pp@4K 677 against
+893 (76 %).**
+
+**Guard fix in the same commit.**  The new code self-defined `STRATA_WMMA_GFX11` for *any* HIP build
+(`#if defined(STRATA_BACKEND_HIP) && !defined(...)`), which cannot tell gfx11 from any other HIP target.  Moved
+to the build: `target_compile_definitions(strata_kernels_hip PRIVATE STRATA_WMMA_GFX11=1)` under the same
+`CMAKE_HIP_ARCHITECTURES MATCHES gfx11` condition the prefill target uses, and removed the self-definition.
+Verified after rebuilding: the define is in `strata_kernels_hip`'s flags, the code is *still* compiled in (4
+`launch_wmma` symbols in the object - the check that matters, since a guard mistake here compiles the fallback
+silently), and the harness still reports 4-5x with FAILURES 0.

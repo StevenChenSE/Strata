@@ -382,5 +382,33 @@
     "prefill_ms": 6912.6,
     "prefill_tok_s": 592.4,
     "note": "both WMMA paths; second pair 7117.9 ms (575.3); all-rocBLAS 8040 ms -> -11 to -14%"
+  },
+  {
+    "model": "IQ3_S",
+    "max_new": 1,
+    "exit": 0,
+    "spec": "2",
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "1k-pa-wmma",
+    "prompt_tokens": 1023,
+    "prefill_ms": 2437.9,
+    "prefill_tok_s": 419.62,
+    "note": "WMMA prompt attention (default); pairs 2507.3/2437.9/2451.3 ms = 408.0/419.6/417.3 tok/s; emulated attention 2595/3057/2784 ms = 394/335/367 -> WMMA wins all three; CUDA counterpart 419 tok/s"
+  },
+  {
+    "model": "IQ3_S",
+    "max_new": 1,
+    "exit": 0,
+    "spec": "2",
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "4k-pa-wmma",
+    "prompt_tokens": 4095,
+    "prefill_ms": 6045.0,
+    "prefill_tok_s": 677.42,
+    "note": "vs emulated attention 6610.8 ms (619.4 tok/s) = +9.4%; phase qsa attn 201 ms (3.4%) vs 1115 ms (15.7%); CUDA counterpart 893 tok/s"
   }
 ]

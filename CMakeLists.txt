@@ -667,6 +667,13 @@ if(STRATA_ENABLE_HIP)
                                   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/direct_file.cpp)
   add_library(strata_kernels_hip STATIC ${_strata_hip_kernels})
   set_source_files_properties(${_strata_hip_kernels} PROPERTIES LANGUAGE HIP)
+  # RDNA3 matrix instructions (v_wmma_*) exist only on gfx11, and the arch macro cannot be inferred from the
+  # compiler (the host pass of a HIP compile does not define __gfx1100__), so the build supplies it - the same
+  # rule as strata_prefill_hip below.  Without this, wmma users in this target would have to define it
+  # themselves, which cannot distinguish gfx11 from any other HIP target.
+  if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx11")
+    target_compile_definitions(strata_kernels_hip PRIVATE STRATA_WMMA_GFX11=1)
+  endif()
   target_include_directories(strata_kernels_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(strata_kernels_hip PRIVATE third_party/ggml)   # i-quant block layouts (ggml-common.h), same as strata_kernels
   # HIP-language-only: leaking __CUDA_ARCH__ into CXX TUs makes ROCm headers auto-enable
