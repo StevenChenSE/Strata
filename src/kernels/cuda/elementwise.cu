@@ -1,5 +1,6 @@
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -201,6 +202,10 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// the write was not ordered into host-visible memory, so no amount of reading it would show it, and the driver
 /// call was flushing the whole pipeline enough to make it appear.  A 10-22 us driver call per iteration is a
 /// very expensive substitute for one fence instruction.
+///
+/// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  On RDNA4 (gfx1201) a plain store to mapped pinned
+/// memory stays in the GPU's L2 until the stream is synchronized - the host never saw the ring (tests/hip/handoff:
+/// 0 of 100 rings seen without a sync; volatile, a system-scope atomic store or a fence after the store: 100 of 100).
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
 #ifdef STRATA_USE_HIP
@@ -208,7 +213,7 @@ __global__ void doorbell_ring_kernel(uint32_t* seq) {
     // (and the wait's volatile loads may be served stale); system-scope atomics are the contract.
     __hip_atomic_store((unsigned int*) seq, *seq + 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 #else
-    *seq = *seq + 1u;
+    *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
 #endif
 }
 
@@ -223,7 +228,7 @@ __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volati
     }
 #else
     const uint32_t want = *seq;
-    while (*flag != want) __nanosleep(100);
+    while (*flag != want) strata_spin_pause();
 #endif
     __threadfence_system();
 }

@@ -22,6 +22,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 
+#include <cstring>
+
 // STRATA_WMMA_GFX11 is defined by the BUILD (CMakeLists.txt, from CMAKE_HIP_ARCHITECTURES), not inferred
 // from compiler macros: measured on this toolchain the HOST pass of a HIP compile does not define
 // __gfx1100__ but does define __HIP_DEVICE_COMPILE__, so a compiler-macro guard here silently selected the
@@ -233,6 +235,14 @@ static inline bool strata_wmma_gemm_dispatch(const uint16_t* X, const uint16_t* 
                                              void* stream) {
     if (!X || !W || !Y) return false;
     if (T <= 0 || N <= 0 || K <= 0) return false;
+    // Runtime gate (review): run only on gfx11 devices, whatever this build compiled for.  The build-time
+    // STRATA_WMMA_GFX11 macro controls whether the intrinsics compile; this check controls whether they run.
+    {
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
+        if (std::strncmp(prop.gcnArchName, "gfx11", 5) != 0) return false;
+    }
     if (K % 16 != 0) return false;
     if (beta != 0.0f && beta != 1.0f) return false;
     if (ldy <= 0) ldy = N;

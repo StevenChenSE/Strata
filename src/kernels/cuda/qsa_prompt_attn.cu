@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <type_traits>
 
@@ -1051,7 +1052,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 #if defined(STRATA_WMMA_GFX11) && STRATA_WMMA_GFX11
     static const bool pa_wmma_enabled = []() {
         const char* env = std::getenv("STRATA_PA_WMMA");
-        return env == nullptr || std::atoi(env) != 0;
+        if (env == nullptr || std::atoi(env) == 0) return false;   // opt-in (review: not on by default)
+        int dev = 0;                                               // runtime gate (review): gfx11 only
+        hipDeviceProp_t p{};
+        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&p, dev) != hipSuccess) return false;
+        return std::strncmp(p.gcnArchName, "gfx11", 5) == 0;
     }();
     if (pa_wmma_enabled) {
         if (pools.k_q != nullptr) {

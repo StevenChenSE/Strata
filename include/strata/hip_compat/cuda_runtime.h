@@ -2,6 +2,10 @@
 // Included only by STRATA_ENABLE_HIP builds. CUDA builds use NVIDIA headers.
 #define STRATA_USE_HIP 1
 #include <hip/hip_runtime.h>
+// CUDA's <math_constants.h> provides CUDART_INF_F, which CUDA-shaped sources use; HIP spells it HIP_INF_F.  This
+// header is force-included into every translation unit, so mapping it here makes the constant available without
+// every source knowing about the port; the standalone header beside this one covers explicit <math_constants.h>
+// includes.
 #include <hip/hip_math_constants.h>
 #ifndef CUDART_INF_F
 #define CUDART_INF_F HIP_INF_F
@@ -72,10 +76,13 @@
 #define cudaSetDevice hipSetDevice
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamQuery hipStreamQuery
 #define cudaStreamSynchronize hipStreamSynchronize
