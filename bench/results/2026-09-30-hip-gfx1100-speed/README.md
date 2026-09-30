@@ -626,3 +626,19 @@ device** - including the CUDA product on Turing, which the code's own comment ac
 enough for windows of up to 6 tokens").  This also blocks measuring whether deeper draft windows help
 decode.  Delegated fix: fall back to the existing per-token `fused_gr_read` for the tokens that do not fit,
 log it once, and keep the <= 6-token fast path untouched.
+
+### What the window fix unlocks (and that nothing else blocks it)
+
+`src/program/generate.cpp:1200-1202`: with the default `--suffix-draft > 0` and no explicit `--mtp-max-t`,
+the engine sets `mtp_max_t = spec` and then `o.spec = min(spec + 2, 8)` - kVerifyMaxT is 8, so:
+
+| flag | verify window | MTP drafts | today |
+| --- | ---: | ---: | --- |
+| `--spec 4` | 6 | 4 | works |
+| `--spec 6` | 8 | 6 | blocked by the fused_gr shared-memory bug |
+| `--spec 8` | 8 | 8 | blocked by the same bug |
+
+An audit of every dynamic-shared-memory opt-in in `src/kernels/cuda/` shows **`fused_gr.cu:336` is the only
+launch whose shared memory scales with the token count** (the other three opt-ins - `qsa.cu:674`,
+`qsa_prompt_attn.cu:630,661` - are chunk-scaled, which the prompt path already sub-batches).  So the fused_gr
+fallback is sufficient to make windows 7-8 work, and no second limit should bite.
