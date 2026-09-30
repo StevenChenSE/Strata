@@ -1751,3 +1751,32 @@ GEMM then reads the staged blobs from VRAM, which is what the 56 GB/s figure mea
 That does not make the MMQ a good bet - an unpacking-heavy 2-bit dot product has a practical ceiling far below
 the int8 peak, and I have not measured where these kernels sit against it - but it does mean the "probably no
 headroom" framing in SUMMARY.md is a guess rather than a finding, and it is flagged as such.
+
+## The MMQ measured: 16.6 TFLOPS, flat in T - so the last item is a research project, not a lever
+
+Instead of assuming shapes, I dumped the real routing (`--dump-routing`, 1,344 records) and measured the
+router's `k`: **k = 10, uniformly**.  That gives the prefill's true expert work:
+
+| tier | (token, expert) pairs | TFLOP | MoE phase time | achieved |
+| --- | ---: | ---: | ---: | ---: |
+| 4K | 1,965,600 (4095 x 10 x 48) | 19.3 | 1,167 ms | **16.6 TFLOPS** |
+| 32K | 15,728,160 | 154.8 | 9,553 ms | **16.2 TFLOPS** |
+
+where the per-pair work is 4.92M MACs (gate_up 1280x2560 + down 2560x640, both known from the model).
+
+Two things follow, and neither is a lever:
+
+* **The rate is flat in T** (16.6 vs 16.2 TFLOPS).  A small-M or latency-bound kernel would improve as the
+  prompt grows; this does not, so the expert stage is **instruction-throughput-bound** - the dp4a unpack+dot rate
+  itself.  With M ~ 60 tokens per expert on average (pairs / visits), the dequantisation is already amortised
+  across tokens, which is why the earlier "6-7 % of VRAM bandwidth" figure was the wrong lens as well.
+* **It is llama.cpp's kernel.**  `mul_mat_q<...>` is upstream's tuned code, so there is no cheaper local win -
+  only a *different* kernel.  Against the card's ~123 TOPS int8 peak this is 13 %, but the practical ceiling for
+  a 2-bit codebook format is far below the int8 peak and I have **not measured it**, so "there is 2x here" would
+  be a guess in the other direction.
+
+The one untested idea is a **fused** dequant-into-SMEM + WMMA expert kernel - not the unfused variant that
+measured 41 % slower, since fusing keeps the expanded weights in shared memory instead of writing and re-reading
+a VRAM scratch.  Plausible worth: 1.2-1.8x on these phases, i.e. 4-16 % of the prefill.  Cost: a new kernel per
+quantised format, of which the reference implementation of one format runs to 2,106 lines.  That is a project,
+not a bounded change, and it is the honest state of the last item.
