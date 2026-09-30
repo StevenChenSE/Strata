@@ -430,3 +430,29 @@ Two conclusions:
   five *projections* (`Gemm::native` = `dequant_f16` + rocBLAS, prefill.cpp:683 -> gemm.cu:96), not the
   recurrence.  `use_mmq` (prefill.cpp:1320) covers only the expert GEMMs; the 12 dense `native_proj` sites
   always dequantize the weight into scratch first, per chunk.
+
+## Round 9: the shallow staging path costs 20 % of the prefill below T = 2048 (confirmed)
+
+`stream_all` (prefill.cpp:891) is `m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr` with
+`STREAM_ALL_MIN = 2048`, so any prompt whose chunk is smaller takes the shallow `lookahead = STAGE - 1 = 7`
+staging walk instead of the deep ring.  The engine's `T` is `min(--prefill, n_tokens - 1)`, so the boundary
+is testable with two adjacent prompt lengths - same work, one predicate flip:
+
+| engine T | path | prefill | pp | exposed `wait copy` |
+| ---: | --- | ---: | ---: | ---: |
+| 2046 | shallow | 4,764.7 ms | 429.4 tok/s | 930 ms (20.3 %) |
+| 2047 | shallow | 4,632.4 ms | 441.9 tok/s | 930 ms (20.8 %) |
+| **2048** | **deep ring** | **3,798.8 ms** | **539.1 tok/s** | **142 ms (3.9 %)** |
+
+**+22 % pp and the exposed copy wait falls 20.8 % -> 3.9 %** for one token of extra prompt.  The clean 1K
+runs sit at 577-588 ms of exposed copy wait (22.9-24.2 % of a 2,476-2,572 ms prefill), so 1K prompts pay
+this today: lowering the threshold (or making it overridable) should recover roughly a fifth of the 1K
+prefill.
+
+Two caveats recorded honestly:
+
+* an earlier single run showed `gather` at 632 ms (26 %) for a 1K prompt and I read it as a staging stall;
+  five clean runs show `gather` at 10-16 ms, so that was an outlier run (it was also 40 % slower overall),
+  not a phase.  The exposed `wait copy` figure is the reproducible one.
+* the first attempt at this experiment used a 2047-token prompt, which gives engine T = 2046 - below the
+  threshold, so both arms took the shallow path.  The pairing has to be 2048/2049 *tokens* for T = 2047/2048.
