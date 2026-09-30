@@ -2238,3 +2238,31 @@ pre-merge binary (4K: 797/853 vs 933/938, no overlap), with tg roughly neutral. 
 hipBLASLt fallback running uncalibrated (their table is version-mismatched here), the ported nanosleep pacing
 (`s_sleep(1)` vs our `s_sleep(8)`), and upstream's reworked prefill - are listed in
 [REBASE-UPSTREAM.md](REBASE-UPSTREAM.md).  Harness: `bench/tools/gate_merged.py`.
+
+## The prompts: what each measurement actually ran on
+
+Recorded because the prompt is not neutral - see the diversity section, where the same 4,095 tokens taken from
+one repository's C++ versus three projects in three languages moved decode acceptance from 0.976 to 0.700.  All
+prompts are tokenised with `bench/tools/tok_ascii.py` (the pack's own vocabulary, round-trip checked) and are
+committed under `bench/tools/prompts/`.
+
+| file | tokens | source |
+| --- | ---: | --- |
+| `1k.txt` | 1,023 | `src/core/expert_source.cpp` (the source named in the earlier 1K entry) |
+| `4k.txt` | 4,095 | `src/core/*.cpp` + `src/prefill/*.cpp` + `src/kernels/cuda/*.cu` - one repository's C++, i.e. **narrow** |
+| `4k_narrow.txt` | 4,095 | the same corpus as `4k.txt` (the diversity trio's narrow arm) |
+| `4k_diverse.txt` | 4,095 | deepseek-harness TypeScript + llama.cpp CUDA + vLLM-serving Python - three projects, three languages |
+| `4k_prose.txt` | 4,095 | markdown documentation |
+| `32k.txt` | 32,767 | the same narrow corpus as `4k.txt` - verified by re-tokenising it and matching the first ids (`320,2212,5152,30211,...`) |
+| `33k_mixed.txt` | 33,000 | ~150 KB each from the same four codebases as the diversity trio plus our own src - the **mixed** corpus |
+| `42k_mixed.txt` | 42,000 | the same mixed corpus, for the fixed-tail depth curve |
+
+**The inconsistency this exposes.**  The 4K comparisons (upstream-vs-ours, the gate, merged-vs-master, every lever
+sweep) used `4k_diverse.txt` - the representative choice.  The 32K three-way used `32k.txt`, the **narrow** one.
+That matters because the diversity measurement says narrow code text is the *flattering* case for decode: our
+engine's acceptance there was 0.976 against 0.700 for diverse text.  The 32K run showed our engine at **1.000**
+acceptance, so its 60.7 tok/s and the size of its decode advantage over master and merged are likely optimistic.
+
+The 32K *ranking* is still fair - all three arms ran the identical prompt, interleaved, with the order rotated -
+but the absolute numbers carry the topic-range caveat, which is why the three-way was re-run on the mixed
+33K-token prompt (`33k_mixed.txt`).
