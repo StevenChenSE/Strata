@@ -642,3 +642,26 @@ An audit of every dynamic-shared-memory opt-in in `src/kernels/cuda/` shows **`f
 launch whose shared memory scales with the token count** (the other three opt-ins - `qsa.cu:674`,
 `qsa_prompt_attn.cu:630,661` - are chunk-scaled, which the prompt path already sub-batches).  So the fused_gr
 fallback is sufficient to make windows 7-8 work, and no second limit should bite.
+
+## Round 15: the window fix lands - `--spec 6/8` no longer crash, and deeper windows are a wash
+
+With the fused_gr fallback in place (`fit` tokens through the fused path, the rest per-token, warning logged
+once), the first-ever window-8 measurements (MTP, `--expert-cache auto`, `--prefill 2048`, real-text prompt):
+
+| `--spec` | verify window | rounds | tokens/round | draft accept | ms/round | decode |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **4** | **6** | 76 | 3.38 | 0.854 | **68.9** | **48.88 tok/s** |
+| 6 | 8 | 62 | **4.15** | 0.783 | 96.0 | 43.00 tok/s |
+| 8 | 8 | 66 | 3.95 | 0.720 | 102.4 | 37.89 tok/s |
+
+A window of 8 accepts **23 % more tokens per round** (4.15 vs 3.38) and still loses, because a round costs
+39 % more.  Two reasons, and they matter for anyone tempted to "fix" this further:
+
+* the extra window work itself (8 tokens verified instead of 6), and
+* the fallback's cost: 2 of 8 tokens per layer go through the per-token `fused_gr_read`, i.e. 96 extra
+  kernel pairs per round, worth roughly 10 ms of the 27 ms increase.
+
+So even a chunked-smem GR kernel (which would remove the fallback cost) would leave window 8 at best at
+parity (43.00 -> ~48 tok/s at 96 - 10 = 86 ms/round = 20.7 ms/token vs 20.4 for window 6).  **`--spec 4`
+stays optimal**, and the value of the fix is that `--spec >= 5` no longer segfaults: the window is now
+bounded by the engine's own `kVerifyMaxT = 8` with a diagnostic instead of a core dump.

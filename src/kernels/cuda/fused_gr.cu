@@ -300,7 +300,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                          int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
-        std::exit(1);
+        std::_Exit(1);
     }
     GrMulti m;
     for (int t = 0; t < n_tok; ++t) {
@@ -310,36 +310,73 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
-            std::exit(1);
+            std::_Exit(1);
         }
     }
     m.xn = xn_scratch;
-    m.T = n_tok;
-    cudaStream_t st = (cudaStream_t) stream;
-    gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
-    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+
     // the shared-memory opt-in is a per-DEVICE setting: once per device, not once per process (a layer split
     // runs this kernel on two cards)
+    static int dev_optin[64] = {};
     static bool attr[64] = {};
     int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64 || !attr[dev]) {
-        // at most what the card allows (Turing: 64 KB - enough for windows of up to 6 tokens)
-        int optin = 0;
-        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        int want = (int) (kFusedGrMaxT * TILE * sizeof(float));
-        if (optin > 0 && want > optin) want = optin;
-        cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-        cudaGetLastError();
-        if (dev >= 0 && dev < 64) attr[dev] = true;
+    (void) cudaGetDevice(&dev);
+    int optin = 0;
+    if (dev >= 0 && dev < 64) {
+        if (!attr[dev]) {
+            // at most what the card allows (Turing: 64 KB - enough for windows of up to 6 tokens)
+            (void) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            int want = (int) (kFusedGrMaxT * TILE * sizeof(float));
+            if (optin > 0 && want > optin) want = optin;
+            (void) cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            (void) cudaGetLastError();
+            dev_optin[dev] = optin;
+            attr[dev] = true;
+        } else {
+            optin = dev_optin[dev];
+        }
+    } else {
+        (void) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
     }
-    gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
-    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    if (optin <= 0) optin = 49152;
+
+    constexpr size_t per_tok = (size_t) TILE * sizeof(float);
+    int fit = (int) (optin / per_tok);
+    if (fit > kFusedGrMaxT) fit = kFusedGrMaxT;
+    if (fit > n_tok) fit = n_tok;
+
+    if (n_tok > fit) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                         "fused_gr_read_multi: window %d exceeds the %d B shared-memory opt-in; using the per-token path\n",
+                         n_tok, optin);
+            warned = true;
+        }
+    }
+
+    if (fit > 0) {
+        m.T = fit;
+        cudaStream_t st = (cudaStream_t) stream;
+        gr_norm_multi_kernel<<<fit, THREADS, 0, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) fit * per_tok, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+        gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    } else if (stamp_buf) {
+        gpu_stamp(stamp_buf, stamp_i0, stream);
+        gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+    }
+
+    for (int t = fit; t < n_tok; ++t) {
+        fused_gr_read(a[t], stream);
+    }
+
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        std::fflush(stderr);
+        std::_Exit(1);
     }
 }
 
@@ -352,7 +389,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
         (a.apply && a.inj_prev == a.inject_out)) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
-        std::exit(1);
+        std::_Exit(1);
     }
     cudaStream_t st = (cudaStream_t) stream;
     gr_down_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
@@ -360,7 +397,8 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read: %s\n", cudaGetErrorString(e));
-        std::exit(1);
+        std::fflush(stderr);
+        std::_Exit(1);
     }
 }
 
