@@ -330,3 +330,19 @@ This box's slot is PCIe 4.0 **x8** (the user's x16 is split with another GPU; me
 pp gap at 4K is a hardware bandwidth gap over *expert-streaming bytes*, and the remaining software lever
 there is fewer streamed bytes (residency/profile), not kernel work: the non-streaming part of the
 prefill is comparable between the two boxes.
+
+### Correction: the expert blob is 1.95 MiB, not ~1.7 MB - the streaming share is larger
+
+The header of the pack's `native_experts.txt` states the exact total: **50,292,326,400 B over 24,576
+experts (48 layers x 512)** = **2,046,400 B = 1.95 MiB per expert blob** (per-layer values in the file
+run 1,510,400 - 2,176,000 B).  My earlier "~1.7 MB" estimate was low, so the streaming shares above are
+understated.  Recomputed at the measured 14.2 GB/s link:
+
+| run | blobs streamed | bytes | DMA time | prefill | share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1K, best (2,429 ms) | 6,947 | 14.2 GB | 1,001 ms | 2,429 ms | **41 %** |
+| 1K, typical (2,968 ms) | 6,947 | 14.2 GB | 1,001 ms | 2,968 ms | 34 % |
+| 4K (8,275 ms) | 26,864 | 55.0 GB | 3,871 ms | 8,275 ms | **47 %** |
+
+Nearly half of the 4K prefill is expert bytes crossing a PCIe 4.0 x8 link.  That is the pp gap, and it
+also bounds what any kernel work can recover on this box.
