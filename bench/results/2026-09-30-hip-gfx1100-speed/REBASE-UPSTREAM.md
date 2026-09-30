@@ -322,3 +322,41 @@ Three consequences worth being precise about:
 To make it engage one would either use a ROCm whose hipBLASLt is 1.1.0/1.2.0 - which is what their
 `setup.sh --backend hip` arranges by installing a pinned ROCm from TheRock wheels, ~10 GB, no sudo - or re-tune on
 1.4.1 with their own `tools/hip/tune_hipblaslt.cpp` (419 lines, vendored here) and write a 100401 table.
+
+## Three-way at 32K: our branch wins outright, and the merged build's decode is bimodal
+
+The decision-relevant tier measured directly - our branch, upstream master, and the merge, at 32K depth
+(32,767-token prompt, `--max-context 36864`, `--kv int8`, 128 decoded tokens), each arm on its own documented
+configuration but with `--spec 2` common to all three (the optimum our engine measured at this depth), 3 reps with
+the order rotated per repetition:
+
+| arm | pp median (range) | tg median (range) | acceptance |
+| --- | ---: | ---: | ---: |
+| **ours** | **1141.4** (1012-1205) | **60.7** (54.4-61.2) | **1.000** |
+| master | 809.9 (806-840) | 54.9 (51.6-55.2) | 0.836 |
+| merged | 1127.4 (920-1176) | 48.4 (46.7-59.0) | 0.806 |
+
+**Prefill**: ours and merged both beat master in **3/3 pairs each** - ours +41 %, merged +39 % - and are a wash
+against each other (1141 against 1127).  **Decode**: ours wins **3/3 pairs against both** (+10.6 % over master,
++25 % over merged's median).
+
+The draft accounting explains the decode column, and is the most interesting result of the whole exercise:
+
+| arm | rounds r1/r2/r3 | acceptance r1/r2/r3 | tokens/round |
+| --- | --- | --- | ---: |
+| ours | 66 / 66 / 66 | 1.000 / 1.000 / 1.000 | 1.94 (identical) |
+| master | 72 / 72 / 72 | 0.836 / 0.836 / 0.836 | 1.78 (identical) |
+| merged | 66 / 74 / 75 | 1.000 / 0.806 / 0.794 | 1.94 / 1.73 / 1.72 |
+
+Ours and master are *deterministic* in their drafting - the same rounds and the same acceptances in every
+repetition.  The merged build is **bimodal**: one repetition drafted exactly like ours (1.000, giving tg 59), two
+behaved like a degraded master (0.79-0.81, giving tg ~48).  That is precisely the wide decode range seen in every
+earlier merged measurement, and it explains why the 4K comparisons kept flipping between "parity" and "-7 %": they
+were sampling two different modes.
+
+**Recommendation, revised on this evidence.**  For 32K work - the tier this model exists for - **stay on
+`hip-gfx1100`**: the merge gains nothing on prefill (a wash), loses ~20 % on decode, and introduces the draft-mode
+instability; master alone is 41 % behind on prefill.  The merge's real value is categorical rather than
+throughput: the 13x cheaper MTP prompt, six releases of engine work, k8v4, the setup/server changes and their HIP
+test suite.  Caveat on this comparison: `--spec 2` was imposed on all three arms, so master was not run at its
+documented `--spec 4`; at this depth our own engine prefers 2, but theirs was not swept.
