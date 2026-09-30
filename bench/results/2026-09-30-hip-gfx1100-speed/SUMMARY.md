@@ -50,6 +50,10 @@ memory bandwidth with all six physical cores in use.
 | GDN recurrence load software-pipelining | `gdn rec` 1,694 → 1,580 ms at 32K (−6.7 % of the phase, 0.25 % overall) |
 | MMQ gather batching + sub-phase timing + GDN sub-phases | instrumentation that made the above attributable |
 
+The GDN recurrence prefetch is worth 0.25 % overall (6.7 % of its phase), and the batched MMQ gather is time
+neutral - the idle simply moved to `wait copy`.  Both are kept because they are real and reversible, not because
+they are large.
+
 Both WMMA GEMMs and the WMMA attention were verified independently: exact against a host fp64 reference on
 exactly-representable inputs (`maxdev = 0.000e+00`, 0 NaN, all shapes), the gfx1100 code objects contain real
 `v_wmma_*` instructions, and the 8-token seed reproduces the reference token for token under the emulated
@@ -64,8 +68,9 @@ attention path.
 * **Dequant+WMMA for streamed experts** (`STRATA_PREFILL_MMQ=0`): **41 % slower** — a dense weight is
   dequantised once and reused across all tokens, but an expert block is streamed and used ~once, so expanding it
   to fp16 multiplies its bytes ~3.5×.  The quantised dp4a path is correct for experts.
-* **A deeper copy ring** (`STRATA_PREFILL_RING=384`): worse, and the gap metric is itself noisy (±20 %), so the
-  test is inconclusive rather than a clean refutation.
+* **The copy ring is a lever, not a dead end** (corrected): an earlier A/B compared 384 with 384 - the default
+  already *is* 384, because the expert arena is fully pinned - so it was a no-op.  Measured properly, 96 -> 384 is
+  worth **+6.2 %** and 384 -> 512 is neutral, so the default is the optimum.
 * **`--pcie-mode dma`** is genuinely ~0–6 % faster but **must not be the default**: the call site records
   issue #31, a host hang inside `cudaMemcpyAsync` on a driver lock, which the shader path exists to avoid.
 * **A parallel GDN scan** would break the kernel's deliberate bit-parity with its predecessor, so it is off the
@@ -84,10 +89,23 @@ attention path.
 * Waits are inflated by tracing, so kernel-trace *shares* of wait kernels are upper bounds; the engine's own
   phase table is the better instrument for attribution.
 
-## The one remaining item
+## Nothing is left: every item is taken, refuted, measured to its ceiling, or hardware
 
-The expert MMQ kernels (~20 % of the 32K prefill) are llama.cpp's tuned dp4a code.  They are the only
-substantive lever never attempted, and they are a project rather than a bounded change — with uncertain
-headroom, since the quantised path is already established as correct and these formats are unpacking-bound
-rather than int8-peak-bound.  Everything else is either taken, refuted, or attributed to the PCIe 4.0 ×8 link
-and this machine's RAM bandwidth.
+The expert MMQ was the last open item and it is now measured rather than guessed.  Its rate is **16.6 TFLOPS,
+flat in T** (from the real routing: k = 10, so 4095 × 10 × 48 = 1,965,600 pairs at 4.92M MACs each), and a probe
+using the intrinsic llama.cpp uses here (`__builtin_amdgcn_sudot4`) puts the practical ceiling at **21.7 TOPS**
+for a realistic 2-bit block dot (26.3 TOPS for the bare dot).  The engine is therefore at **76 % of its
+ceiling**, leaving at most 1.31x on the MoE phases - 20 % of the 4K prefill - and that bound assumes a redesign
+pays nothing for the int8->fp16 conversion it would need.  (This also corrects the denominator: the dot peak is
+26.3 TOPS, not the card-quoted ~123 TOPS int8, so the engine was 63 % of the right ceiling all along.)
+
+The copy ring is at its measured optimum: **96 -> 384 is worth +6.2 %** (14 ms of buffer against ~26 ms stalls),
+and 384 -> 512 is neutral while costing 2 % of expert-cache residency.  The residual `wait copy` idle is
+**host-driven**, not a GPU pipeline problem: the issuer keeps the copy stream exactly `ring` entries ahead with
+waits that are already satisfied at enqueue time, so only stalls longer than 58 ms show up - and those are the
+host's (per-chunk PLE/embedding work, and interference from whatever else this box is doing, which is also what
+makes the 4K tier the unstable one).
+
+So the remaining gaps are the PCIe 4.0 ×8 link (running at 80 % of its measured peak while busy) and this
+machine's host side.  Everything else was taken, refuted, or measured.
+
