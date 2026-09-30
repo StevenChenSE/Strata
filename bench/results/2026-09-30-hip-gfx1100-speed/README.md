@@ -2121,3 +2121,29 @@ Verified before commit: `DRY_RUN=1` prints the command; `TEXT=` tokenises throug
 (round-trip True, 3.16 chars/token on AGENTS.md); `--help` prints the config rationale; an unknown option and a
 missing prompt are both rejected; and a real run of a 1,022-token prompt with `--max-new 8` exited 0 (prefill
 529.7 tok/s, decode reported, session up).
+
+## Why 1K prefill reports ~530 tok/s when 4K/32K report ~1,000
+
+Asked why a 1,022-token run reported 529.7 tok/s when the headline prefill figures are ~1,000.  Both are correct;
+they are different prompt lengths, and the effect is large.  Measured interleaved, 3 reps each:
+
+| case | pp median | range |
+| --- | ---: | --- |
+| 1K prompt (1,022 tokens = **one** chunk), launcher default (256K ctx / int8) | **528.6** | 524-531 |
+| 1K prompt, 4K context with fp16 KV (bigger expert cache) | 530.4 | 399-540 |
+| **4K prompt** (4,094 tokens), launcher default | **867.4** | 835-868 |
+
+Two conclusions:
+
+* **The 256K/int8 configuration costs nothing at 1K** - 528.6 against 530.4, i.e. inside the noise.  The capacity
+  reduction (17.23 -> 14.28 GiB of expert cache) does not bind at this depth.  (At 32K it may cost something, but
+  the comparison there is confounded by the prompt and the session drift below, so it is not claimed.)
+* **Prefill throughput is prompt-length dependent** because the fixed per-run costs - model load, expert-stream
+  plan, PLE rows, and the copy/compute pipeline fill - amortise over the prompt, and a 1,022-token prompt is a
+  single `--prefill 2048` chunk, so the pipeline never fills.  Hence this record's range: ~530 at 1K, ~867 at 4K,
+  ~973-1,079 at 32K.
+
+**And a cross-session drift to keep in mind.**  The same configurations measured in the earlier x16 session gave
+1K 602.5 and 4K 1,016; today they give 528.6 and 867.4 - 12-15 % lower, which is larger than the within-session
+spread (the 1K range here is 524-531).  So absolute prefill figures must be quoted as a range and compared only
+within one session; the earlier note said ~10 % and this revises it to ~12-15 %.
