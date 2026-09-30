@@ -2066,3 +2066,35 @@ flatter acceptance on its own code.)
 So 4 draft tokens remains optimal at short context, but **at 32K the optimum is 2** - the per-verified-token
 cost grows with context, so the window that pays for itself shrinks.  This also removes the confound in the x8
 sweep, where `--spec 2` ran without MTP and looked far worse (26.5 tok/s) than it is (42.1 at 1K).
+
+## Decode throughput against context depth, at 256K capacity with INT8 KV
+
+The requested configuration is `--max-context 262144 --kv int8`; measured at depths 0 / 4K / 8K / 32K of *filled*
+context, 64 decoded tokens, `--spec 2` (the draft length that won at long context), interleaved x3.  A first pass
+that used nested prefixes was confounded - each depth continued from a different place in the corpus, so MTP
+acceptance varied because of *what* was being continued (4K continued TypeScript at 0.923, 32K the Python/CUDA
+part at 1.000) - so every point here is `[N tokens of history] + [the same 512-token tail]`, the tail taken from a
+disjoint part of the corpus:
+
+| depth | pp tok/s | tg median | tg range | acceptance | tok/round |
+| --- | ---: | ---: | --- | ---: | ---: |
+| 0 (tail only) | 394.2 | 40.0 | 39.2-42.7 | 1.000 | 2.60 |
+| 4K | 831.1 | 39.4 | 38.5-39.4 | 0.917 | 2.03 |
+| 8K | 939.4 | 43.0 | 41.7-49.9 | 1.000 | 2.60 |
+| 32K | 972.8 | 43.9 | 38.8-50.7 | 1.000 | 2.06 |
+
+Expert cache was 7,529 slots / 14.28 GiB at every point, so depth is the only variable.
+
+**Decode throughput is flat in depth** - 39-44 tok/s from an empty context to 32K, with the differences inside the
++-15 % run-to-run spread (the 32K range alone spans 38.8-50.7).  That is the QSA scheme working as designed: each
+query attends to a bounded selection rather than the whole context, so per-token attention cost does not grow with
+depth.  Prefill, by contrast, rises steeply with depth (394 -> 831 -> 939 -> 973 tok/s) because the fixed per-run
+costs amortise over more tokens.
+
+Note for comparison: earlier 32K decode measured 55.6 tok/s, but that was a one-repo C++ prompt (which flatters
+acceptance by ~14 %, see the diversity section) at 32K capacity (expert cache 17.23 GiB rather than 14.28).  So the
+two configurations are not directly comparable and the capacity's own cost on tg is **not yet isolated** - that
+needs the same depth at both capacities.
+
+Also recorded: depth 0 had to be a real prompt.  A single-token `--tokens 9707` run emitted EOS immediately and
+reported `decode 0 tokens in 0.0 ms`, which is why the first pass has no depth-0 row.
