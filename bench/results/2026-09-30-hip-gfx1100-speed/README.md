@@ -906,3 +906,22 @@ i.e. **six bf16 GEMMs per layer** (three per half) plus three small elementwise 
 `Gemm::bf16` path the BF16 WMMA variant targets, so the expected gain from that work is the GEMM share of this
 phase - with the bf16 GEMMs measured at 204 ms of the 731 ms of rocBLAS time in a 1K prefill (28 %), a 2x
 faster kernel should be worth roughly 4-6 % of prompt throughput.
+
+### Scoping note 2: the "dequant" phase is a per-expert relayout, and it is launch-bound
+
+`pt.mark(kPfDequant)` (prefill.cpp:1402) does **not** dequantize on the MMQ path - it calls
+`mmq::gather_native` (moe_mmq.cu:151), which is just `copy16_kernel` (or `copy1_kernel`) moving the expert's
+gate/up halves interleaved plus its down matrix into a 16-expert group slot.  Two measured facts:
+
+* it is called **once per expert**: 26,864 times in the 4K prefill (one per streamed blob), and `MMQ_GROUP = 16`
+  with the author's own comment "experts per MMQ launch (the gather is per expert, as blobs arrive)" - the
+  per-expert granularity is deliberate, so the GPU can start an expert as soon as its blob lands;
+* the phase costs 933 ms at 4K = **35 us per expert**, while the copy itself is ~2 MB and should take ~3 us at
+  VRAM bandwidth.  So the phase is launch/host-bound, not bandwidth-bound (~26,864 small launches).
+
+So the next candidate after the bf16 work is to remove the relayout rather than speed it up: the MMQ kernels
+consume the group slot only because their operands are contiguous, and each expert's GGUF blocks are already
+contiguous in its own blob - passing a per-expert source pointer/offset (the same indirection idea noted for the
+decode path's `fetch_blobs_kernel`) would delete the gather and its extra VRAM traffic outright.  Alternatives
+are batching the gather per `MMQ_GROUP` (which sacrifices the arrival-order pipelining the comment describes) or
+capturing the walk in a graph (hard: the walk's length and order are data-dependent).
