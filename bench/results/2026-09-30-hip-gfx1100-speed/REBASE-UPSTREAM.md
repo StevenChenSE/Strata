@@ -453,3 +453,41 @@ work onto the CPU.)
 This changes the adoption picture: the merge needs no bug fix for decode, only `--pcie-frac 0` in its
 configuration - at the cost of whatever prefill the PCIe share was buying, which has *not* been measured for the
 merged build at 32K and is the next thing to check.
+
+## Does `--pcie-frac 0` buy better tg and pp?  No - it costs on both, and it only masks the flip
+
+The previous section presented `--pcie-frac 0` as the fix for the merged build's decode instability.  Measured
+properly - three arms, order rotated per repetition, three reps, 32K depth, `--expert-cache 9000 --spec 2
+--adapt-every 2 --kv int8`, acceptance 1.000 in every run of every arm:
+
+| arm | pp median (range) | tg median (range) |
+| --- | ---: | ---: |
+| merged, `--pcie-frac 0` | 1104.9 (1077-1163) | **52.4** (45.6-58.6) |
+| merged, `--pcie-frac 0.30` | **1136.6** (1122-1282) | **57.6** (54.7-58.1) |
+| ours, `--pcie-frac 0.30` | 1031.9 (1008-1070) | 55.0 (48.9-58.7) |
+
+So `--pcie-frac 0` is **9 % worse on tg and 2.9 % worse on pp** than the 0.30 default on the merged build.  The
+phase tables say why, and they also correct an assumption of mine: `--pcie-frac` was documented as governing the
+*verify windows*, i.e. decode, but it moves prefill work too:
+
+| phase (merged, one rep) | frac 0 | frac 0.30 |
+| --- | ---: | ---: |
+| wait copy | 2,468 | 3,903 |
+| **dequant** | **2,423** | **621** |
+| gemm gate/up | 5,283 | 2,478 |
+| gdn | 4,443 | 4,243 |
+
+Removing the PCIe share does not remove the work, it moves it: fewer copy-engine stalls, but far more host-side
+dequantisation - a near-wash on prefill throughput and a real cost in decode, where the CPU must now compute every
+miss.
+
+**Correction to the earlier framing.**  In this run the `--pcie-frac 0.30` arm did **not** flip: three reps, all
+1.000 acceptance.  So the flip is an *intermittent* timing effect rather than something 0.30 causes, and
+`--pcie-frac 0` merely removes the PCIe path's timing dependence at a genuine performance cost.  Note also that
+frac 0 stabilised the *answers* here but not the *speed* (45.6-58.6 tok/s): answers follow expert placement, which
+frac 0 pins, while speed follows host conditions (PLE, arena load), which it does not.
+
+**And the comparison sharpens the case for fixing the real thing.**  In this same session the merged build with
+`--pcie-frac 0.30` was the **fastest of the three on both axes** - prefill 1,136.6 against our 1,031.9 (+10 %) and
+decode 57.6 against our 55.0 (+4.7 %).  So when it does not flip it is the best build available; the remaining work
+is to remove the intermittent placement nondeterminism in code, not to work around it with a flag that costs 9 %.
