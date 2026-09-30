@@ -787,3 +787,51 @@ Two consequences:
   (dense projections are 27-43 % of it depending on tier) and what the emulated attention and the expert MMQ
   kernels are.  The reference project's "copy engine is idle during the GEMM" note is true of its own setup;
   measured here, the copy engine and kernels overlap for 27 % of the window and the union leaves only 13 %.
+
+## Round 20: WMMA GEMM for the dense projections - correct and 2x faster in isolation, but NEUTRAL end-to-end
+
+Implemented (delegated, `workflow-13`, modelled on the `../vllm-serving` reference): a HIP-only RDNA3 WMMA
+FP16 GEMM in `src/prefill/wmma_gemm.{h,cu}`, dispatched from `Gemm::f16` for `T >= 16` and `beta in {0,1}`
+with `hipblasGemmEx` as the fallback (`STRATA_WMMA_GEMM=0` forces the old path for A/B).  Two variants:
+`gemm_wmma_16x16_1w` (single wave, no LDS) and `gemm_wmma_64x64_4w` (4 waves, double-buffered W in LDS).
+Wave32 "doubled" input fragments and the C mapping follow the reference's documented layouts.
+
+**Correctness (verified independently, not taken on trust):** the delegated probe reported 0.00e+00 error
+for every shape, which is not credible for a different accumulation order - and it turned out to be a
+NaN-blind comparison (`std::max` never updates on NaN, and a broken host `__ushort_as_half` made both sides
+NaN).  `bench/tools/wmma_gemm_min_check.cu` re-tests with conversion-free data (all-ones fp16, so the answer
+must be exactly K):
+
+| shape | Y[0] | expected | wrong | NaN |
+| --- | ---: | ---: | ---: | --- |
+| 16x16x16 | 16.000 | 16 | 0 | 0/256 |
+| 16x16x32 | 32.000 | 32 | 0 | 0/256 |
+| 33x48x64 (ragged T,N) | 64.000 | 64 | 0 | 0/1584 |
+| 64x64x96 (4w path) | 96.000 | 96 | 0 | 0/4096 |
+| 7x16x32 (small T) | 32.000 | 32 | 0 | 0/112 |
+
+and the engine's 8-token seed run reproduces the pre-change output exactly
+(`271 7734 264 13280 9834 421 15339 279`), so the change is numerically faithful in practice.
+
+**Isolated throughput** (`bench/tools/wmma_gemm_test.cu`, my rocBLAS column reproduces my own probe's
+12.3-13.6 TFLOPS exactly):
+
+| shape | WMMA | rocBLAS |
+| --- | ---: | ---: |
+| 12288x1023x2560 | 22.4 TFLOPS | 13.4 |
+| 1023x2560x12288 | 22.1 | 12.3 |
+| 2560x1023x12288 | 25.1 | 12.2 |
+| 5120x1023x2560 | 15.4 | 13.1 |
+| 4096^3 | 29.7 | 13.0 |
+
+**End-to-end: no measurable change.**  Five interleaved 1K pairs: medians 3,062 ms (WMMA) vs 3,126 ms (off),
+~2 % - inside the run-to-run spread, and the phase table shows no systematic drop in `qsa proj`/`gdn`.  Two
+clean 4K pairs are identical to 0.02 % (7,980.7 vs 7,969.6 ms; 7,907.7 vs 7,906.2) - one earlier 10,902 ms
+WMMA run was an outlier, not a regression.
+
+**Lesson that corrects Round 13:** the "dense projections are 42.9 % of the 1K prefill" figure came from
+aggregating rocprof kernel durations over ~1000 *small* launches, where per-launch profiling overhead
+inflates the sum.  A 2x faster kernel for that component moves the wall clock by ~0, so the true share is
+small and the dense GEMMs are not on the prefill's critical path.  Kept enabled because it is correct, never
+slower, HIP-only with a fallback, and a foundation for a fused dequant+WMMA variant; the probe is preserved
+at `bench/tools/`.

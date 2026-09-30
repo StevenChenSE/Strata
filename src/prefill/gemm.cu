@@ -2,6 +2,10 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 
+#ifdef STRATA_BACKEND_HIP
+#include "wmma_gemm.h"
+#endif
+
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
@@ -86,6 +90,15 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+#ifdef STRATA_BACKEND_HIP
+    // STRATA_WMMA_GEMM=0 is the A/B arm: force the hipblasGemmEx path even where WMMA would be used.
+    static const bool wmma_on = std::getenv("STRATA_WMMA_GEMM") == nullptr;
+    if (wmma_on && T >= 16 && (beta == 0.0f || beta == 1.0f)) {
+        if (strata_wmma_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream_)) {
+            return;
+        }
+    }
+#endif
     const float alpha = 1.0f;
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,

@@ -691,8 +691,8 @@ if(STRATA_ENABLE_HIP)
   target_include_directories(strata_engine_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine_hip PUBLIC strata_core_hip strata_kernels_hip strata_kernels_cpu hip::host)
 
-  add_library(strata_prefill_hip STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
-  set_source_files_properties(src/prefill/gemm.cu src/prefill/kernels.cu PROPERTIES LANGUAGE HIP)
+  add_library(strata_prefill_hip STATIC src/prefill/gemm.cu src/prefill/wmma_gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  set_source_files_properties(src/prefill/gemm.cu src/prefill/wmma_gemm.cu src/prefill/kernels.cu PROPERTIES LANGUAGE HIP)
   target_include_directories(strata_prefill_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # leaving STRATA_PREFILL_MMQ undefined compiles prefill.cpp's built()-false stub set; the
   # real MMQ path arrives with strata_mmq built from llama.cpp's GGML_HIP sources (phase 2)
