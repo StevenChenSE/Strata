@@ -360,3 +360,50 @@ instability; master alone is 41 % behind on prefill.  The merge's real value is 
 throughput: the 13x cheaper MTP prompt, six releases of engine work, k8v4, the setup/server changes and their HIP
 test suite.  Caveat on this comparison: `--spec 2` was imposed on all three arms, so master was not run at its
 documented `--spec 4`; at this depth our own engine prefers 2, but theirs was not swept.
+
+## Why the merge "loses" decode: it is timing-dependent nondeterminism, not a design deficit
+
+Asked directly, because the merge is supposed to be upstream's engine plus our kernels and should therefore be at
+least as good as either.  It is - when it computes the same way.  Two mechanical explanations were tested and both
+are refuted; what remains is a run-to-run instability in the merged build itself.
+
+**Test 1: the cache size.**  The merged build's cache is 46 slots smaller than ours (upstream's deliberate
+draft-head reservation), which changes the resident set and, per this project's AGENTS.md, "different residency
+sends an expert down a different (CPU vs GPU) arithmetic path, and the tokens diverge".  Both arms were forced to
+the same 9,262 slots:
+
+| arm | slots | tg median | accepted drafts over 3 reps | tokens/round |
+| --- | ---: | ---: | --- | ---: |
+| ours | 9,262 | **59.6** | 62 / 62 / 62 = 1.000 every time | 1.94 |
+| merged | 9,262 | **57.1** | 70 / 62 / 62 = **0.814, then 1.000, 1.000** | 1.94 |
+
+Equal caches did not equalise acceptance, so the 46 slots are not the cause.
+
+**Test 2: the adaptive tier's timing-dependent swaps.**  With adaptation frozen (`--adapt-every 0`) the residency
+is fixed, so any remaining flip is in the computation rather than the selection:
+
+| configuration | tg per rep | rounds | acceptance |
+| --- | --- | --- | --- |
+| merged, `--adapt-every 0` | 48.49 / 38.18 / 39.01 | 74 / 66 / 66 | **0.809 / 1.000 / 1.000** |
+| merged, `--adapt-every 2` (control) | 58.03 / 60.51 / … | 66 / 66 | 1.000 / 1.000 |
+
+Frozen residency still flips - and is much slower overall (median 39.0, because without adaptation the CPU pool
+does more work).  So the adaptation is not the driver either.
+
+**What the data does say.**  In its good mode the merged build is *identical* to ours: 66 rounds, 1.94 tokens per
+round, 62/62 drafts accepted, 58-61 tok/s.  Its deficit is that the same binary with the same flags and the same
+input sometimes lands at 0.809 acceptance and ~48 tok/s instead.  With residency frozen, the only thing left that
+differs between those repetitions is **timing** - so the merged build carries a timing-dependent nondeterminism in
+its own compute path.
+
+The prime suspect is the seam the merge created: our **VRAM-doorbell verify handshake** combined with upstream's
+**reusable pinned staging buffer** for expert uploads.  Those are two different solutions to the same problem,
+glued together by taking ours for `verify.cpp`/`verify_kernels.cu` and theirs for the staging in
+`expert_cache.cpp` - and a race there would occasionally feed the draft head a different or stale hidden state,
+which on a hard acceptance threshold shows up exactly as observed.
+
+**Consequence for adoption.**  The merge does not lose decode by construction, so this is a bug to find rather
+than a reason to reject it - and if it is fixed the merge would be at least our equal on decode while keeping
+upstream's prefill and features.  The specific race is a hypothesis, not yet shown: it would be confirmed by
+forcing the synchronisation in the verify path (or by instrumenting what the draft head actually reads) and seeing
+the flip disappear.
