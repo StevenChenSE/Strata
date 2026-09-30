@@ -166,5 +166,43 @@
     "experts_streamed": 26864,
     "prompt": "real C++ 4096 tok via bench/tools/tok_ascii.py",
     "chunks": 2
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "mtp": "q2_0",
+    "run": "1k-real-mtp-pre512",
+    "decode_tok_s": 47.37,
+    "decode_ms": 5403.9,
+    "prefill_tok_s": 239.67,
+    "prefill_ms": 4268.4,
+    "spec_tokens_per_round": 2.98,
+    "spec_accept": 0.815,
+    "spec": "4",
+    "spec_min_p": 0.5,
+    "mtp_ms_per_round": 3.03,
+    "prefill_chunk": 512
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "mtp": "q2_0",
+    "run": "1k-real-mtp-pre2048",
+    "decode_tok_s": 40.08,
+    "decode_ms": 6386.9,
+    "prefill_tok_s": 290.16,
+    "prefill_ms": 3525.7,
+    "spec_tokens_per_round": 3.24,
+    "spec_accept": 0.859,
+    "spec": "4",
+    "spec_min_p": 0.5,
+    "mtp_ms_per_round": 3.432,
+    "prefill_chunk": 2048
   }
 ]

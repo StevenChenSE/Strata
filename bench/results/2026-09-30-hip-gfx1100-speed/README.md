@@ -480,3 +480,61 @@ separate stream's shader duration overlaps the compute stream (the measured effe
 same overlap lesson as before.  The three `wait_flag_ge_kernel` waits (10.5 ms/round = ~32 % of a 33 ms
 round) are *genuine* producer latency - the host's pool and the expert DMAs - so they are not removable by
 tuning the kernel; the backoff is only 100 ns (`__nanosleep(100)`), not the poll interval I first suspected.
+
+## Round 11: MTP lands (the tg gap is essentially closed), and a withdrawn claim
+
+### MTP: 33.15 -> 40.1-47.4 tok/s on the same real-text prompt
+
+The draft head was fetched (`tools/mtp_fetch.py`), packed (`mtp_pack.py --experts q2_0`, 0.889 GB) and
+turned into the runtime dir (`mtp_rt.py` + `data/draft_vocab.bin`), then run with the documented
+`--mtp <rt>`:
+
+| run | rounds | tokens/round | draft accept | tg | mtp cost |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| no MTP (suffix/lookahead drafter) | 200 | 1.28 | 0.277 | 33.15 tok/s | - |
+| MTP, `--spec 4 --spec-min-p 0.5`, `--prefill 512` | 87 | **2.98** | **0.815** | **47.37 tok/s** | 3.03 ms/round |
+| MTP, same, `--prefill 2048` | 79 | 3.24 | 0.859 | 40.08 tok/s | 3.43 ms/round |
+| **CUDA counterpart (MTP, real code prompts)** | - | 2.77 | - | **50.5 tok/s** | - |
+
+So gfx1100 now reaches **79-94 % of the CUDA counterpart's decode** against 66 % before, with *better*
+acceptance than the CUDA bench recorded (2.98-3.24 vs 2.77 tokens/round); the spread between the two runs
+is the round latency (62 vs 81 ms/round), i.e. which experts the prompt's prefill left resident.
+
+Configuration note: `--mtp` takes 799 MiB of VRAM (675 experts + 111 dense), so with a large expert cache
+the 2048-token prefill buffers no longer fit - `strata generate: prefill: device buffers for a chunk of
+2048 tokens do not fit` and exit 1.  `--prefill 512` (as `docs/ORCA.md`'s config uses) works.
+
+### Withdrawn: "the shallow staging walk costs 20 % below T = 2048"
+
+The boundary experiment looked convincing (T=2047: 441.9 tok/s with 930 ms of exposed copy wait; T=2048:
+539.1 tok/s with 142 ms), and the delegated `STRATA_PREFILL_STREAM_ALL_MIN` override was built to test it.
+Three **interleaved** repetitions with the env override on an otherwise idle machine:
+
+| rep | default (shallow) | forced deep |
+| --- | ---: | ---: |
+| 1 | 340.93 tok/s (wait 568 ms) | 352.25 (585 ms) |
+| 2 | 333.66 (601) | 326.92 (583) |
+| 3 | 339.78 (553) | 340.09 (627) |
+| median | **339.78** | **340.09** |
+
+No effect.  The earlier T=2046/2047 arms (429/442 tok/s, 930 ms) were taken while the 5 GB MTP download was
+running, and re-running T=2047 alone on an idle machine gave 545.5 tok/s with 113 ms - the same as the
+"deep" arm I had credited.  **The threshold claim is withdrawn**; the env override stays as a harmless
+diagnostic (default unchanged).
+
+### What actually moves 1K pp: the expert path
+
+Comparing the phase tables of a 397.7 tok/s run and a 343.7 tok/s run, the difference is entirely in the
+expert phases:
+
+| phase | fast run | slow run | delta |
+| --- | ---: | ---: | ---: |
+| dequant | 249 ms | 490 ms | +241 |
+| gemm gate/up | 237 | 348 | +111 |
+| gemm down | 110 | 155 | +45 |
+| gdn | 558 | 455 | -103 |
+| wait copy | 577 | 619 | +42 |
+
+So 1K pp should be quoted as a **range (340-420 tok/s)** with the phase table as the explanatory artifact,
+and any A/B below ~20 % needs interleaved repetitions on an idle machine - the single biggest methodology
+lesson of this session.
