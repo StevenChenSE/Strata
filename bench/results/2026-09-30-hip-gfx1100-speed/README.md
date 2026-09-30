@@ -1552,3 +1552,38 @@ be treated as indicative until both sides are re-run with identical options.
 stalls at 4K (1,413 ms of 5,412 ms, 26 %), which the mechanical explanations (ring depth, VRAM contention,
 scattered reads, rotating slots, adaptive tier, GPU sharing, CPU frequency, host chunk-setup) have all failed to
 explain.  That is ~24 % of the 4K prefill and the last unexplained item in the model.
+
+## Round 38: the copy-engine gaps are an ordering effect, not bandwidth - the last unexplained item now has a mechanism
+
+Correlating the two traces **from the same 4K run** (`--memory-copy-trace --kernel-trace`) settles what the
+copy engine stalls on.  The expert stream has 66 gaps > 1 ms totalling **1,507 ms**, and **84 % of that time has
+a kernel running**:
+
+| kernel overlapping the gaps | gap time | launches |
+| --- | ---: | ---: |
+| `gemm_wmma_64x64_4w<half>` | 394 ms | 301 |
+| `gemm_wmma_64x64_4w<bf16>` | 212 ms | 339 |
+| `prompt_attn_wmma_kernel` | 167 ms | 12 |
+| `gdn_rec_cols_kernel` | 97 ms | 37 |
+| `dequant_kernel<14,...>` | 80 ms | 128 |
+| `mul_mat_q<...>` (MMQ) | 68 ms + 28 + 26 | 53 |
+
+So over half the stall time coincides with the dense WMMA projections and attention - the kernels this session
+added.
+
+**It is not bandwidth.**  My earlier probe used a plain streaming-copy kernel as the load, which is not what the
+engine runs, so I re-ran it with the actual kernel (`bench/tools/dma_vs_wmma_probe.cu`, the engine's
+`strata_wmma_gemm_f16` on its `12288x1023x2560` shape, launched continuously on another stream):
+
+    idle 12.9 GB/s   during gemm_wmma 13.3 GB/s   idle again 13.5 GB/s
+
+The copy engine and a saturating WMMA GEMM coexist fine.  Since the copies are enqueued on a separate stream and
+the issuing is driven by the walk's progress (`give_back` -> `issue_until(consumed + ring)`), the mechanism that
+fits the evidence is **ordering, not contention**: while the walk is inside a long non-MoE kernel it consumes no
+experts, so the copy stream runs out of supply it is allowed to start (each copy's destination slot is released
+by an event recorded on the compute stream) and idles.  That is ~26 % of the 4K prefill.
+
+**Fix direction** (delicate, same class as the decode's): decouple the expert-copy supply from the compute
+stream's progress - deeper issuing that does not wait on consumption, or slot-free signalling that does not ride
+on the compute stream - with the ring's capacity as the bound.  I am recording it as a mechanism with a
+direction, not as a verified fix, because the pipeline change needs its own careful measurement.
