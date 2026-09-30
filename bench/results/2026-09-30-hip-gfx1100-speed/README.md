@@ -2098,3 +2098,26 @@ needs the same depth at both capacities.
 
 Also recorded: depth 0 had to be a real prompt.  A single-token `--tokens 9707` run emitted EOS immediately and
 reported `decode 0 tokens in 0.0 ms`, which is why the first pass has no depth-0 row.
+
+## The tuned configuration, as a script: `tools/run-tuned.sh`
+
+Everything measured above is now a launcher on this branch, with the measured winners as its defaults:
+
+```
+tools/run-tuned.sh --tokens 9707,11,52903 --max-new 64
+tools/run-tuned.sh --tokens-file /tmp/prompt.txt --max-new 256
+TEXT=notes.md TEXT_MAX_TOKENS=4096 tools/run-tuned.sh --max-new 128
+DRY_RUN=1 tools/run-tuned.sh --tokens 9707        # print the exact command, run nothing
+```
+
+Defaults: `--kv int8`, `--max-context 262144`, `--spec 2`, `--prefill 2048`, `--pcie-frac 0.30`,
+`--expert-cache auto`, `HIP_VISIBLE_DEVICES=0`, 900 s `timeout`, output to `/tmp/strata-run.log`.  Each is
+overridable (`GPU CTX KV SPEC PREFILL PCIE_FRAC CACHE MAXNEW TIMEOUT_S KV_RESIDENT TIMING DATA BIN OUT`), and
+the header records *why* each default is what it is.  Two deliberate choices worth knowing: `SPEC=2` is the
+long-context optimum, so use `SPEC=4` for short-context work; and `--kv q4_0` is available but its quality is
+not validated here, so `int8` is the default.
+
+Verified before commit: `DRY_RUN=1` prints the command; `TEXT=` tokenises through `bench/tools/tok_ascii.py`
+(round-trip True, 3.16 chars/token on AGENTS.md); `--help` prints the config rationale; an unknown option and a
+missing prompt are both rejected; and a real run of a 1,022-token prompt with `--max-new 8` exited 0 (prefill
+529.7 tok/s, decode reported, session up).
