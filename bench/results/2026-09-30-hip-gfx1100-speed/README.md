@@ -1084,3 +1084,43 @@ tie - the 1K prompt had none in 128 tokens, the seed prompt has one at index 5.
 header under the captured-graph path (its write site is in the non-graph sampling loop) and `--dump-final-r`
 writes 0 bytes, while `--no-capture` requires `--no-pool` and changes the model.  "A near-tie flip" is
 therefore inferred from the harness's FP64 accuracy and the divergence pattern, not measured at the logits.
+
+### Correction + the WMMA attention result (same round)
+
+**Correction to the note above.**  The claim that `--max-new 8` and `--max-new 128` give different tokens *for the
+same path* was wrong: the engine binary was rebuilt at **12:43:08** by the WMMA-attention job *while those runs
+were in flight* (`lock_*` finished 12:43:07 on the old binary and are valid; `seed_*` at 12:44 used the new one).
+That is my own experiment-hygiene failure - I checked binary mtimes afterwards, not before.
+
+**The WMMA prompt attention is verified and fast.**  `qsa_prompt_attn_parity_hip` (its "new" path is now the
+WMMA kernel), 3 reps:
+
+| case | old per-token | emulated batched | **WMMA** |
+| --- | ---: | ---: | ---: |
+| int8 ctx 4096, 1024 q | 19.20 ms | 22.90 ms (0.84x) | **5.17 ms (3.71x)** |
+| fp16 ctx 4096, 1024 q | 19.00 | 31.16 (0.62x) | **6.44 ms (2.95x)** |
+| int8 ctx 1500, 1024 q | 11.47 | 11.70 (0.96x) | **2.75 ms (4.17x)** |
+| int8 ctx 2100, 256 q | 6.63 | 6.04 (1.09x) | **1.63 ms (4.07x)** |
+
+`FAILURES: 0` in both configurations, and the WMMA path's own error against FP64 is 3.65-4.96e-06 against the
+emulated path's 2.68-5.19e-06 - the same order, so it is not a precision regression.  If the 4K `qsa attn`
+phase (1,115 ms) scales like the harness suggests (~3.7x), this is worth roughly 11 % of the 4K prefill.
+
+**But it changes the port's 8-token regression artifact**, which must be an explicit decision: with the three
+paths on one stable binary and a fixed cache,
+
+| path | seed output |
+| --- | --- |
+| emulated (previous default) | `271 7734 264 13280 9834 421 15339 279`  <- the reference |
+| old per-token | `271 7734 264 13280 9834 421 3817 4603` |
+| WMMA (new default) | `271 7734 264 13280 9834 1608 83871 8708` |
+
+All three agree for five tokens and then each diverges at a different place.  `STRATA_PA_WMMA=0` restores the
+exact reference in one env var, so parity remains available; the default is now the fast path, which is the
+stated objective, but the artifact should be re-baselined rather than treated as a failure.
+
+**Also flagged from the diff review:** the new code self-defines `STRATA_WMMA_GFX11` for *any* HIP build
+(`#if defined(STRATA_BACKEND_HIP) && !defined(STRATA_WMMA_GFX11)`) instead of taking it from the build's
+architecture setting.  On this repo (gfx1100 only) that is harmless, and the device code does emit real
+`v_wmma_f32_16x16x16_f16` instructions, but on a non-gfx11 HIP target it would try to compile gfx11 intrinsics
+rather than fall back.  It should be moved behind the same build-provided define the prefill targets use.
