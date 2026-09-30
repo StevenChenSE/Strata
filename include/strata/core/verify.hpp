@@ -160,6 +160,17 @@ private:
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     void* ymis_dev_ = nullptr;                            // HIP: device mirror of m_ymiss_
+    // HIP: the window doorbells live in DEVICE memory (the driver's stream-ops wait observes VRAM
+    // reliably; polls of mapped HOST memory on gfx1100 miss host stores).  Raised by 4-byte DMAs.
+    void* d_flag_ = nullptr; void* d_flagA_ = nullptr; void* d_flagB_ = nullptr;
+    cudaStream_t hip_dma_ = nullptr;
+    cudaStream_t hip_wait_ = nullptr;
+    void* d_seq_ = nullptr;                               // HIP: monotone ring counter in VRAM
+    unsigned seq_base_ = 0;                               // host-side base for the current window
+    void* d_pub_x_ = nullptr; void* d_pub_ids_ = nullptr; void* d_pub_w_ = nullptr;
+    // HIP: the doorbell kernel's payload (x/ids/w) lands in VRAM - shader stores to mapped host
+    // memory have no writeback guarantee on RDNA3, so the host D2H-copies the payload instead of
+    // reading mapped memory.
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
