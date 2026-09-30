@@ -1400,3 +1400,32 @@ That reframes the tg@32K gap (37.87 vs 49.0 tok/s): the extra ~27 ms/round is ex
 tier policy (keep the hot set resident), not kernel work on the attention.  Note also that the profiled items
 sum to ~41 ms of an ~81 ms round at 1K, i.e. **~39 ms/round of the decode is in the draft/sampling path**, which
 the profile does not label - a second, unexamined target.
+
+## Round 33: the decode round is linear in the verify window (~13-15 ms per verified token), and spec 3-4 is the measured optimum
+
+Varying the window (which is `min(spec + 2, kVerifyMaxT)`), 64 fresh tokens, 1K prompt, recommended options
+otherwise:
+
+| config | window | ms/round | tokens/round | **ms per window slot** | tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `--spec 2`, no MTP | 4 | 52.0 | 1.38 | 13.0 | 26.5 |
+| `--spec 3` + MTP | 5 | 68.0 | 2.78 | 13.6 | 40.9 |
+| `--spec 4` + MTP | 6 | 85.7 | 3.56 | 14.3 | **41.5** |
+| `--spec 6` + MTP | 8 | 123.2 | 4.00 | 15.4 | 32.5 |
+
+So the round costs **13-15 ms per verified token**, independent of what the profile labels, and the optimum is
+where tokens/round stops outgrowing the per-round cost: **spec 3-4 (40.9/41.5 tok/s)**, with spec 6 losing
+badly (32.5).  That is an independent confirmation of the configuration this file has recommended since the MTP
+work.
+
+This also corrects the previous entry's framing.  There, I subtracted the profiled items from the round and
+called the remainder "the draft/sampling path, ~39 ms/round".  The window-scaling here shows the scaling
+quantity is **per verified token, not per round**, and that the profiled items are *nested* (at 32K they sum to
+129.5 ms against a 100 ms round, which is only possible if the window line contains the pool line).  So the
+honest statement is: the round grows ~13-15 ms per window slot and the profile accounts for roughly a third of
+that growth; **the identity of the remaining per-token cost is not yet attributed.**
+
+Ruled out as the explanation: the LM head on the CPU (`src/core/native_head.cpp` uploads `output.weight` to the
+device, and its FP64-accurate path is a GPU kernel), the QSA attention (the selection reads a bounded cell set,
+~0.05 ms of MACs per token), and the MTP drafting (the profile measures 1.5-4.2 ms per *round*).  What would
+settle it is a timer inside the window itself, per verified token, rather than the current per-round labels.
