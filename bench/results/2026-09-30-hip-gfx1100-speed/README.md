@@ -1587,3 +1587,36 @@ by an event recorded on the compute stream) and idles.  That is ~26 % of the 4K 
 stream's progress - deeper issuing that does not wait on consumption, or slot-free signalling that does not ride
 on the compute stream - with the ring's capacity as the bound.  I am recording it as a mechanism with a
 direction, not as a verified fix, because the pipeline change needs its own careful measurement.
+
+## Round 39: the copy-engine idle is attributed but has no found lever - and the ring A/B is inconclusive
+
+Two hypotheses tested and closed:
+
+* **The idle is real idle.**  In the same 4K run, other streams' copies overlap the 53 gaps by **3 ms out of
+  1,032 ms (0 %)**.  The engine is not busy with someone else's work.
+* **The ring depth is not the lever.**  `STRATA_PREFILL_RING=384` (against the default 96, since
+  `g_pinned_share` is below 0.9 here: 96 x ~150 us is 14 ms of buffer against ~26 ms stalls) gave gaps of
+  1,242 ms versus 1,032, with one 224 ms stall the default run did not have, and a slower prefill
+  (7,031 vs 5,821 ms).  The cache trade-off I expected does **not** explain it either: `experts streamed` and
+  `resident` were identical (26,753/16,238 vs 26,764/16,241).
+
+But the honest caveat is that **the gap metric is itself noisy**: across three 4K traces the total gap was 1,413,
+1,507 and 1,032 ms - a +-20 % spread on the very quantity I was trying to use for a low-noise comparison.  So
+the ring result is *inconclusive* rather than a clean refutation, and with wall-clock spreads of +-11-47 % on
+this box, micro-tuning this last item is not a productive use of measurement time.
+
+**Status of the item:** attributed (the copy supply is ordered behind the compute stream's consumption, which is
+by design - "a slot is refilled only once the compute stream has recorded that it is done with it"), coincident
+with the dense WMMA projections and attention (84 % of the gap time has a kernel running, over half of it those
+kernels), and *without* a found lever: not bandwidth, not other traffic, not the ring.
+
+**Remaining candidates, with their measured sizes** (so the next round can pick on evidence rather than
+appetite):
+
+| target | size | note |
+| --- | ---: | --- |
+| expert MMQ GEMMs | 9,553 ms of 47,375 = **20 %** at 32K | llama.cpp's kernels; ~11 TFLOPS effective against the card's ~123 INT8 TOPS, so there is apparent headroom, but it is the largest and longest-shot project left |
+| copy-engine idle | 1.0-1.5 s = **18-26 %** at 4K | attributed, no lever found |
+| GDN recurrence | 1,732 ms = **3.7 %** at 32K | 192 blocks x 128 threads = 24k lanes on a GPU with ~196k: a serial scan using ~12 % of the machine, so a bounded kernel project with a clean target |
+| PCIe expert transfer (decode) | 24 ms/round = 28 % | link-bound; the DMA alternative hits issue #31 |
+| CPU expert pool | 33.6-60.6 ms/round | at the machine's memory bandwidth with every physical core in use |
