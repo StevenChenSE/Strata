@@ -1203,3 +1203,26 @@ So at 32K the two streaming-related phases (`wait copy` + the gather that waits 
 moving experts across this box's PCIe 4.0 x8 link (14.2 GB/s measured; 262,555 blobs streamed, 115,481
 resident of 512/layer at 193 of 512 for a 4K run).  That is the remaining structural gap against a counterpart
 on PCIe 5.0 x16, not kernel efficiency.
+
+### Quantifying the 32K streaming floor: the gap is the link, but ~20 % of it is unoverlapped
+
+From the same run's own counters: 262,555 expert fetches of 2,046,400 B = **537 GB in 47.4 s = 11.3 GB/s**,
+against the **14.2 GB/s** this box's PCIe 4.0 x8 link measured in a standalone H2D probe - so the stream already
+runs at **80 % of the link**.
+
+| | value |
+| --- | ---: |
+| link time if perfectly overlapped | 37.8 s of the 47.4 s wall |
+| unhidden streaming (= `wait copy` phase) | **9.6-9.8 s = 21 %** |
+| a PCIe 5.0 x16 counterpart at ~52 GB/s | 10.3 s of DMA = 47 % of its 22.0 s prefill |
+
+Two conclusions, and they point in the same direction:
+
+1. The 4K/32K prompt-throughput gap against the counterpart is **structural**: the same byte volume crosses a
+   link with roughly a quarter of the bandwidth, so no amount of kernel work removes it.  (The two streaming
+   phases being 40 % of the 32K prefill is the same statement in phase-table form.)
+2. It is not *entirely* structural.  The link is busy 80 % of the wall, so **21 % of the 32K prefill is expert
+   streaming that is not hidden behind compute** - and the two independent measurements (the phase table's
+   `wait copy` at 9,772 ms and the arithmetic's 9.6 s) agree to within 2 %.  That is the remaining software
+   lever at long context: prefetching deeper/earlier so the copy engine never idles while the SMs wait, which is
+   what `STRATA_PREFILL_RING` and the chunked stream plan govern.
