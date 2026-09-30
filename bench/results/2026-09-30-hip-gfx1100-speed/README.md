@@ -1164,3 +1164,42 @@ to the build: `target_compile_definitions(strata_kernels_hip PRIVATE STRATA_WMMA
 Verified after rebuilding: the define is in `strata_kernels_hip`'s flags, the code is *still* compiled in (4
 `launch_wmma` symbols in the object - the check that matters, since a guard mistake here compiles the fallback
 silently), and the harness still reports 4-5x with FAILURES 0.
+
+## Round 27: the 32K tier gains most from the WMMA attention (pp 690.6 tok/s, +28 %), and decode is untouched
+
+The prompt attention's share grows with context, so the 32K tier benefits most.  Measured with the recommended
+configuration (`--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --adapt-every 2 --mtp ...`):
+
+| metric | value | counterpart | ratio |
+| --- | ---: | ---: | ---: |
+| pp @32K | **690.6 tok/s** (47,448 ms / 32,767 tokens, 16 chunks) | ~1,490 | **46 %** (was 35-38 %) |
+| pp @1K (same run) | 410.2 tok/s | 419 | 98 % |
+| tg @1K, 256 tokens | **49.47 tok/s** | 50.5 | 98 % |
+| tg @32K, 128 tokens | 37.87 tok/s (acceptance 0.913, 3.79 tokens/round) | 49.0 | 77 % |
+
+The decode path is unchanged by construction (the prompt attention is prefill-only), and the 1K decode confirms
+it at 49.47 tok/s.  The 32K decode number is not directly comparable to the earlier 40.5 tok/s: it moved with
+the acceptance rate, which the *prefill's* numerics influence (the new attention shifts the trajectory at
+~1e-6, exactly as the path comparison in Round 25 showed).
+
+The 32K phase table (47,375 ms) now reads:
+
+| phase | ms | share |
+| --- | ---: | ---: |
+| wait copy | 9,772 | 20.6 % |
+| dequant (the per-expert gather) | 9,202 | 19.4 % |
+| gemm gate/up | 6,306 | 13.3 % |
+| gdn (qkv/gate/alpha/beta) | 4,360 | 9.2 % |
+| gemm down | 3,247 | 6.9 % |
+| hc read | 2,728 | 5.8 % |
+| **qsa attn** | **2,420** | **5.1 %** |
+| qsa proj | 1,879 | 4.0 % |
+| gdn rec | 1,732 | 3.7 % |
+| gdn out | 1,643 | 3.5 % |
+| the rest (embed, router, ple, combine, select, host grouping, gather) | ~2,000 | 4.4 % |
+
+So at 32K the two streaming-related phases (`wait copy` + the gather that waits on the same arrivals) are
+**40 %** of the prefill and the expert MMQ GEMMs another 20 % - i.e. the long-context tier is dominated by
+moving experts across this box's PCIe 4.0 x8 link (14.2 GB/s measured; 262,555 blobs streamed, 115,481
+resident of 512/layer at 193 of 512 for a 4K run).  That is the remaining structural gap against a counterpart
+on PCIe 5.0 x16, not kernel efficiency.

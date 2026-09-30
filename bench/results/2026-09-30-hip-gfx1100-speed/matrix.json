@@ -410,5 +410,45 @@
     "prefill_ms": 6045.0,
     "prefill_tok_s": 677.42,
     "note": "vs emulated attention 6610.8 ms (619.4 tok/s) = +9.4%; phase qsa attn 201 ms (3.4%) vs 1115 ms (15.7%); CUDA counterpart 893 tok/s"
+  },
+  {
+    "model": "IQ3_S",
+    "exit": 0,
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "32k-pa-wmma-pp",
+    "prompt_tokens": 32767,
+    "max_new": 128,
+    "spec": "4",
+    "prefill_ms": 47448.1,
+    "prefill_tok_s": 690.6,
+    "note": "WMMA prompt attention; was 521-572 tok/s (35-38% of the CUDA counterpart's ~1490) -> 46%"
+  },
+  {
+    "model": "IQ3_S",
+    "exit": 0,
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "1k-tg-recommended",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "spec": "4",
+    "decode_tok_s": 49.47,
+    "note": "decode unchanged by the prefill-only attention change; CUDA counterpart 50.5"
+  },
+  {
+    "model": "IQ3_S",
+    "exit": 0,
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "32k-tg-recommended",
+    "prompt_tokens": 32767,
+    "max_new": 128,
+    "spec": "4",
+    "decode_tok_s": 37.87,
+    "note": "acceptance 0.913, 3.79 tokens/round; CUDA counterpart 49.0"
   }
 ]
