@@ -1,5 +1,9 @@
 # HIP / gfx1100 baseline — first working decode (engine 0.1.23, branch `hip-gfx1100`)
 
+> **Start with [`SUMMARY.md`](SUMMARY.md).**  It distils this file: final numbers and their caveats, the prefill
+> and decode cost models, what each change was worth, what was refuted and why, the measurement rules learned
+> here, and the one remaining item.  This file is the chronological record it is drawn from.
+
 RX 7900 XTX 24 GB (gfx1100, ROCm 7.14), single GPU, native IQ3_S pack
 (`/home/jianwei/Strata-data/packs/iq3_s`, 46.84 GiB expert arena in pinned host memory, 5341-slot
 VRAM expert cache), shards in `/home/jianwei/Strata-data/models/IQ3_S/`.  Greedy.  This is the first
