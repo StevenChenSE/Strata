@@ -179,7 +179,11 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
 }
 
+#if defined(__HIPCC__)
+constexpr int TILE = 1280;             // eight-token tile fits gfx1100's 64 KiB LDS limit
+#else
 constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
+#endif
 constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
 
 // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the
@@ -319,6 +323,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // runs this kernel on two cards)
     static int dev_optin[64] = {};
     static bool attr[64] = {};
+    static int chunk[64] = {};   // Turing port: tokens the down kernel may carry in one launch on this card
     int dev = 0;
     (void) cudaGetDevice(&dev);
     int optin = 0;
@@ -331,6 +336,14 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             (void) cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
             (void) cudaGetLastError();
             dev_optin[dev] = optin;
+            // Turing port: the down kernel stages n_tok*TILE floats of dynamic shared memory - 80 KB at the full
+            // 8 tokens.  A card whose opt-in is below that (Turing: 64 KB, so 7+ tokens fail to launch as
+            // "invalid argument") processes the tokens in slices that fit; a card that reports no opt-in gets what
+            // fits the 48 KB default (4 tokens of the CUDA tile; all 8 of HIP's smaller tile).  The down kernel's
+            // outputs (lo, inject_out) are strictly per-token, so the chunk boundaries are safe, and the up kernel
+            // below still sees every token of the batch in one launch.
+            const int capacity = (optin > 0 ? optin : 48 * 1024) / (int) (TILE * sizeof(float));
+            chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
             attr[dev] = true;
         } else {
             optin = dev_optin[dev];
@@ -340,12 +353,16 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     if (optin <= 0) optin = 49152;
 
-    constexpr size_t per_tok = (size_t) TILE * sizeof(float);
-    int fit = (int) (optin / per_tok);
-    if (fit > kFusedGrMaxT) fit = kFusedGrMaxT;
-    if (fit > n_tok) fit = n_tok;
+    const int chunk_tok = (dev >= 0 && dev < 64 && chunk[dev]) ? chunk[dev] : kFusedGrMaxT;
 
-    if (n_tok > fit) {
+    static const bool force_per_token = []() {
+        const char* env = std::getenv("STRATA_FUSED_GR_PER_TOKEN");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    if (chunk_tok < n_tok && force_per_token) {
+        // Fallback to per-token path when requested for tokens exceeding the shared-memory opt-in
+        const int fit = chunk_tok < n_tok ? chunk_tok : n_tok;
         static bool warned = false;
         if (!warned) {
             std::fprintf(stderr,
@@ -353,25 +370,41 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                          n_tok, optin);
             warned = true;
         }
-    }
-
-    if (fit > 0) {
-        m.T = fit;
+        if (fit > 0) {
+            m.T = fit;
+            cudaStream_t st = (cudaStream_t) stream;
+            gr_norm_multi_kernel<<<fit, THREADS, 0, st>>>(m);
+            if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+            gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) fit * TILE * sizeof(float), st>>>(m);
+            if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+            gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        } else if (stamp_buf) {
+            gpu_stamp(stamp_buf, stamp_i0, stream);
+            gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+        }
+        for (int t = fit; t < n_tok; ++t) {
+            fused_gr_read(a[t], stream);
+        }
+    } else {
+        m.T = n_tok;
         cudaStream_t st = (cudaStream_t) stream;
-        gr_norm_multi_kernel<<<fit, THREADS, 0, st>>>(m);
+        gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
-        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) fit * per_tok, st>>>(m);
+        if (chunk_tok >= n_tok) {
+            gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+        } else {
+            for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
+                const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
+                GrMulti c{};
+                c.xn = xn_scratch + (size_t) c0 * D;
+                c.T = ct;
+                for (int k = 0; k < ct; ++k) c.a[k] = a[c0 + k];
+                gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) ct * TILE * sizeof(float), st>>>(c);
+            }
+        }
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
         gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
-    } else if (stamp_buf) {
-        gpu_stamp(stamp_buf, stamp_i0, stream);
-        gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
     }
-
-    for (int t = fit; t < n_tok; ++t) {
-        fused_gr_read(a[t], stream);
-    }
-
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
