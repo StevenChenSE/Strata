@@ -1008,3 +1008,38 @@ Two incidental findings:
   flip a single argmax there.
 
 Current standing: pp@1K ~385-409 vs the counterpart's 419 (92-98 %), pp@4K 575-592 vs 893 (64-66 %).
+
+## Round 24: the "tensor-core" batched attention is SLOWER than the old path on gfx1100 (and why the default stays)
+
+The prompt attention has two implementations and a built-in harness (`build-hip/qsa_prompt_attn_parity_hip`,
+which FP64-checks both and times them).  Running it:
+
+| case | old (per-token) | batched (emulated mma16816) | ratio |
+| --- | ---: | ---: | ---: |
+| int8 ctx 4096, 1024 q | 19.36 ms | 22.90 ms | 0.85x |
+| fp16 ctx 4096, 1024 q | 19.27 ms | 31.46 ms | **0.61x** |
+| int8 ctx 32768, 2048 q | 36.73 ms | 52.13 ms | **0.70x** |
+| fp16 ctx 32768, 2048 q | 40.16 ms | 59.52 ms | **0.67x** |
+
+Both PASS the FP64 check (errors ~2e-06; they agree with each other to ~7e-06), so the batched path is not
+*wrong* - it is a **pessimisation on this GPU**: its `mma16816` emulation (24 shuffles + ~64 FMAs per 16x8x16
+tile) costs more than the batching saves, whereas the identical code on CUDA uses real tensor cores.
+
+Confirmed in the engine with the existing switch (`STRATA_PROMPT_ATTN_OLD=1`), 4K prefill:
+
+| rep | batched (default) | old path |
+| --- | ---: | ---: |
+| 1 | 6,709 ms total, `qsa attn` 1,072 ms (16.4 %) | 6,258 ms, **614 ms (10.1 %)** |
+| 2 | 7,533 ms, `qsa attn` 1,129 ms (15.3 %) | 6,253 ms, **604 ms (9.9 %)** |
+
+and at 1K the effect disappears (total 2,522/2,535 vs 2,507/2,519 ms; `qsa attn` 99-125 vs 57 ms), because the
+attention is only 4-5 % of a short prefill.
+
+**The default deliberately stays on the batched path.**  The old path is *not bitwise* with the CUDA engine -
+the 8-token seed changes from `271 7734 264 13280 9834 421 15339 279` to
+`271 7734 264 13280 9834 421 3817 4603` - and the batched path was written for exactly that bitwise parity
+(its header says "accuracy but not bitwise" of the alternative).  So this is a real **perf-vs-parity choice the
+owner should make**, not something to flip silently: `STRATA_PROMPT_ATTN_OLD=1` buys 7-17 % at 4K and ~0 at 1K
+at the cost of that parity.  The proper fix is a WMMA prompt attention: it should beat *both* paths (the
+emulated one at 1,115 ms and the old one at 604 ms per 4K prefill) while keeping fp32 accumulation, which is
+also the numerically closest thing this GPU has to CUDA's real `mma.sync`.
