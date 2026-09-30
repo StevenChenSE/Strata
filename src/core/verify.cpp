@@ -69,10 +69,8 @@ static void hip_wait_ge(cudaStream_t cs, const void* dev_flag, unsigned value) {
 // driver's stream-ops wait; mapped-host polls on gfx1100 are not).
 static void hip_raise(cudaStream_t dma, void* d_flag, unsigned int value) {
     // a CP write-value packet: stream-ordered on `dma`, lands in VRAM (L2-coherent with the
-    // polling kernel's glc load), no source buffer.  The sync keeps concurrent raisers (pool
-    // worker vs host thread) from reordering the monotone sequence.
+    // polling kernel's glc load), no source buffer.
     HIP_CK(hipStreamWriteValue32(dma, (hipDeviceptr_t) d_flag, value, 0));
-    HIP_CK(hipStreamSynchronize(dma));
 }
 static bool hip_backend() { return true; }
 
@@ -1224,6 +1222,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+#ifdef STRATA_BACKEND_HIP
+    HIP_CK(hipStreamSynchronize(hip_dma_));
+#endif
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;

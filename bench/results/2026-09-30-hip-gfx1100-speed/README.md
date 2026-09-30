@@ -214,3 +214,56 @@ Forcing the PCIe miss share up (the engine auto-scales it to 0.30 from the 14.3 
 
 Moving misses to the 14.2 GB/s link shrinks the CPU side but makes the GPU wait longer for staged
 experts — net negative.  Keep the probe-driven default.
+
+## Round 3: kernel profile, the per-layer sync, huge pages, and a determinism trap
+
+### rocprofv3 kernel profile (2 decode rounds, 48 layers each)
+
+```
+__amd_rocclr_streamOpsWait   x96   33.61 ms   (0.35 ms each - one per layer per window)
+wait_flag_ge_kernel          x288  21.03 ms   (0.073 ms each - three per layer)
+fetch_blobs_kernel           x96   10.31 ms
+__amd_rocclr_copyBuffer      x486   4.34 ms
+__amd_rocclr_streamOpsWrite  x288   1.89 ms   (three per layer: flags A, B, flag_)
+```
+
+**Half of the decode's GPU kernel time is waiting**, and the single per-layer `streamOpsWait` is the
+`hipStreamSynchronize(dma)` inside `hip_raise` (verify.cpp:75): under the engine's saturated CP queue the
+write packet takes ~0.35 ms to be *serviced*, where a standalone probe with an idle CP sees only
+30 us.  Removing that sync (change 2 below) does **not** hand back 48 x 0.35 = 16.8 ms/round, because the
+sync was hiding behind GPU work: measured, "pool" fell 7.70 -> 4.81 ms/round while "wait for rings" rose
+23.1 -> 25.7 ms/round, for a net +1-5 % (30.30 -> 30.49/30.71 tok/s).  Lesson repeated: kernel-duration
+attribution is GPU-timeline time, not critical-path time.
+
+### `madvise(MADV_HUGEPAGE)` on the arena: measured INERT here
+
+The call succeeds, but nothing materialises:
+
+* with `Rss = 47.9 GiB` (the full arena + weights), `/proc/<pid>/smaps_rollup` reports
+  **`AnonHugePages: 0`**;
+* every `thp_*` counter in `/proc/vmstat` (`thp_fault_alloc`, `thp_collapse_alloc`,
+  `thp_fault_fallback`, `thp_collapse_alloc_failed`) is **unchanged** across whole runs.
+
+Why: the arena is `hipHostRegister`ed, so its pages are pinned (`VM_LOCKED`) and are already faulted in
+by the time the advice is given; khugepaged skips locked VMAs.  The call is kept (it is the right thing
+to ask for, and would take effect where the arena is huge-mapped before it is locked), but its log now
+says "advised", not "ok", and the note records that pinned pages are not collapsed.  Consequence: the
+pool's ~30 GB/s against this box's measured ~45 GB/s line-read ceiling is **not** a page-size problem.
+
+### Determinism trap: acceptance tests must compare matching adaptive states
+
+The engine's output is **not bit-reproducible at a fixed command line**: the adaptive VRAM tier makes
+timing-dependent swap decisions, different residency sends an expert down a different (CPU vs GPU)
+arithmetic path, and the tokens diverge.  Evidence from the `adaptive tier N experts swapped` line:
+
+| run | config | swapped | tokens match |
+| --- | --- | ---: | --- |
+| pre-change A | cache 8192 | 3156 | reference |
+| pre-change B | cache 8192 (different ring env only) | 3156 | **yes** |
+| post-change run 2 | cache 8192 | 3156 | **yes** |
+| post-change run 1 | cache 8192 | 3182 | no |
+| pre-change C/D | cache 4096 | 5270 / 5176 | no (they differ from each other) |
+
+So "identical token sequence" is only a valid acceptance test between runs whose swap count agrees (and
+only then does it prove the change is numerically neutral, which it is here).  The short 8-token seed run
+remains bit-reproducible and is the cheap regression check.

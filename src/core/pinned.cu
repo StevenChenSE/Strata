@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +122,32 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 
 namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
+
+void advise_hugepage(void* addr, uint64_t bytes, std::string& note) {
+    // Advisory only, and measured inert on this port's target: the arena is hipHostRegister()ed, so its
+    // pages are pinned (VM_LOCKED) and are already faulted in by the time we get here - khugepaged skips
+    // locked VMAs, so no 2 MB page is ever allocated.  Measured on the RX 7900 XTX box: with Rss at
+    // 47.9 GiB, AnonHugePages stayed 0 and every thp_* counter in /proc/vmstat was unchanged across the
+    // run.  The call is kept because it is the right thing to ask for (and would take effect where the
+    // arena is mapped huge before it is locked), but it is not a performance lever on 4 KB-page kernels.
+#if !defined(_WIN32) && defined(MADV_HUGEPAGE)
+    if (madvise(addr, (size_t) bytes, MADV_HUGEPAGE) == 0) {
+        std::fprintf(stderr, "strata: madvise(MADV_HUGEPAGE) advised for %llu bytes (advisory; the arena "
+                             "stays on 4 KB pages while it is pinned)\n", (unsigned long long) bytes);
+        note = "madvise HUGEPAGE advised (pinned pages are not collapsed); " + note;
+    } else {
+        const int err = errno;
+        std::fprintf(stderr, "strata: madvise(MADV_HUGEPAGE) failed for %llu bytes: %s\n",
+                     (unsigned long long) bytes, std::strerror(err));
+        note = "madvise HUGEPAGE failed (" + std::string(std::strerror(err)) + "); " + note;
+    }
+#else
+    (void) addr;
+    (void) bytes;
+    std::fprintf(stderr, "strata: madvise(MADV_HUGEPAGE) not supported on this platform\n");
+    note = "madvise HUGEPAGE not supported; " + note;
+#endif
+}
 }  // namespace
 
 namespace {
@@ -151,6 +178,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         if (!capped && e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
+            advise_hugepage(base, bytes, note);
         } else if (bounds.size() >= 2 && (capped || clear_error())) {
             // Plan v0.3 P5: the whole range is refused, so pin it slice by slice from the start.  The rest stays
             // resident through the working-set lock below.  (P6: slices may differ in size, one per layer.)
@@ -171,6 +199,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                              "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); ") +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
+            if (registered_bytes > 0) {
+                advise_hugepage(base, registered_bytes, note);
+            }
             if (registered_bytes < bytes) {
                 const char* env = std::getenv("STRATA_ARENA_LOCK");
                 if (env == nullptr || std::string(env) != "0") {
