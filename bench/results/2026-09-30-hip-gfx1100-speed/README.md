@@ -2017,3 +2017,52 @@ the earlier session (the x16 re-measurement), a ~10 % absolute difference on an 
 configuration.  That is larger than the run-to-run spread within either session, so the headline 4K figure should
 be quoted as a range (~910-1,016) rather than a single value, and cross-session comparisons need the same-session
 baseline.
+
+## Context support, decode diversity, and the draft length at x16
+
+**Context: the engine supports the model's full 256K.**  The GGUF metadata for this pack says
+`qwen4exp.context_length = 262144` (256K, with `rope.freq_base = 1e7`).  `--max-context` is a *capacity* knob
+("KV/state capacity", default 4096) with no code ceiling beyond an int32 guard, so the bound is what fits in
+VRAM - and it fits, because the QSA state is pooled and the expert cache is what yields:
+
+| `--max-context` | session starts | expert cache |
+| --- | --- | ---: |
+| 32,768 | yes | 9,086 slots, 17.23 GiB |
+| 65,536 | yes | 8,627 slots, 16.36 GiB |
+| 131,072 | yes | 7,710 slots, 14.62 GiB |
+| **262,144** | **yes** | 5,859 slots, **11.13 GiB** |
+
+8x the context costs about 6 GiB of expert cache, so long context is affordable - but it *is* paid for in cache,
+i.e. in expert streaming, which is what the long-context prefill already spends its time on.  Caveats: this is
+allocation, not a long run - the longest context actually *run* in this record is 32,767 tokens; and the MTP
+draft window defaults to 32,768 cells (`--mtp-window`), so beyond 32K the drafter attends to only the last 32K.
+KV streaming exists (`qsa_set_kv_resident`, "0: all in VRAM, the default") and was not needed here.
+
+**Decode diversity.**  The prompt-diversity test was prefill-only, so tg was measured separately on the same
+three prompts (64 tokens, interleaved x3):
+
+| prompt | tg median | acceptance | tokens/round |
+| --- | ---: | ---: | ---: |
+| narrow (one repo's C++) | **47.9** | **0.976** | 2.60 |
+| diverse (3 projects, 3 languages) | 42.3 | 0.700 | 2.21 |
+| prose (markdown) | 41.4 | 0.791 | 2.29 |
+
+So the effect is *larger* for decode than for prefill (-14 % against -6 %), and it is carried by **MTP draft
+acceptance** - a homogeneous code prompt is far more predictable to the drafter (0.976) than mixed or prose text.
+That reverses the earlier reading: the one-repo C++ prompt is the *conservative* case for prefill but the
+*optimistic* case for decode, so this record's tg figures are ~14 % high relative to more diverse text.  (One
+possible contributor worth naming: the Strata repository may simply be in-distribution for the model, which would
+flatter acceptance on its own code.)
+
+**Draft length is context-dependent.**  With MTP on for every value, interleaved:
+
+| `--spec` | 1K, 128 tokens | 32K, 64 tokens |
+| --- | ---: | ---: |
+| 2 | 42.1 | **55.6** |
+| 3 | 46.6 | 55.4 |
+| **4** | **47.1** | 52.1 |
+| 6 | 43.9 | 50.8 |
+
+So 4 draft tokens remains optimal at short context, but **at 32K the optimum is 2** - the per-verified-token
+cost grows with context, so the window that pays for itself shrinks.  This also removes the confound in the x8
+sweep, where `--spec 2` ran without MTP and looked far worse (26.5 tok/s) than it is (42.1 at 1K).
