@@ -2316,3 +2316,37 @@ run-length dependent, as recorded earlier.
 To make llama-benchy fully comparable one would have to emit a `tokenizers`-compatible tokenizer for the pack
 (from its `vocab.json`/`merges.txt` plus the pre-tokenizer pattern in `tools/strata_tokenizer.py`); until then,
 read `e2e_ttft` for prefill and the tg column for decode.
+
+### The same run with the CORRECT tokenizer, and what it changes
+
+The gpt2 fallback above was replaced by a real HuggingFace tokenizer for the pack, built by
+`bench/tools/make_hf_tokenizer.py`: the pack's vocabulary is already GPT-2 byte-level (`Ġ` for space), so the
+recipe is `Split(Regex(pre_pattern), isolated)` -> `ByteLevel(add_prefix_space=False)` -> `BPE(vocab, merges)`, and
+the decoder is `ByteLevel`.  Two API details cost a round trip each: this `tokenizers` version wants `merges` as
+pairs rather than `"a b"` strings, and the `pre_pattern` is shipped in the pack's own descriptor, not in an HF file.
+
+**Validation is the important part.**  Against the *engine's* tokenizer (`tools/strata_tokenizer.py`, via
+`Tokenizer.from_gguf`) the build is an **exact match** - identical ids on probe strings and 100.00 % positional
+agreement over 20 KB of C++ (6,135 ids both sides).  The first attempt appeared to score 2 % because it was
+validated against `bench/tools/tok_ascii.py`, a stdlib-only approximation whose pattern cannot express `\p{...}`
+and therefore splits differently; that trap is now documented in the script.
+
+Re-run with `--tokenizer /tmp/iq3_s-hf --runs 2`:
+
+| test | t/s | peak t/s | gpt2 fallback was | e2e_ttft |
+| --- | ---: | ---: | ---: | ---: |
+| tg32 (depth 0) | 47.69 ± 1.06 | 49.23 | 40.57 | |
+| tg32 @ d4096 | 58.44 ± 3.76 | 60.33 | 49.42 | 6,082 ± 541 ms |
+| tg32 @ d8192 | 61.64 ± 1.99 | 63.63 | 52.63 | 9,629 ± 222 ms |
+| tg32 @ d32768 | 59.91 ± 1.12 | 61.84 | 50.65 | **31,883 ± 713 ms** |
+
+The decode rates are ~18 % higher than the fallback's, because the fallback was assembling different prompts, not
+because anything about the engine's speed changed.  The `pp` column is still unusable against this server (it
+divides by a 7 ms time-to-first-response-token; the SSE stream opens before the prefill ends), so prefill is read
+from `e2e_ttft`: 2,545 ms for a 2,048-token prompt at depth 0, and 31,883 ms at depth 32,768, i.e. ~34,800 tokens
+at **~1,090 tok/s**.
+
+**This is an independent confirmation of the hand measurements**: 59.91 tok/s at depth 32K against 60.7 measured
+by the in-house loop at the same tier, and ~1,090 tok/s of prefill against 1,079-1,141.  A different harness, a
+different protocol (32 generated tokens against 128, OpenAI chat requests against direct engine runs) and a
+different prompt, landing on the same numbers.
