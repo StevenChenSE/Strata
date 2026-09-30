@@ -609,3 +609,10 @@ Costs to know: with the vision entry present the server waits for the encoder's 
 the 52 GB text model (mmap) and runs a 4096-token CPU ViT warmup, so service start went from ~30 s to **~16.5 min**
 (the unit's TimeoutStartSec was raised to 1800 accordingly). The encoder is CPU-only; a GGML_HIP build of the helper
 is the later speed-up if image latency ever matters.
+
+Correction: the mmproj was not unique to unsloth. The quant's own source repo,
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF, also ships mmproj-Qwen3.8-Flash-Next-BF16.gguf - now downloaded to
+mmproj-Flash-Next-BF16-ISTA.gguf and compared against the unsloth F16 in use: identical projector (qwen3vl_merger),
+projection_dim 2560, image 768 / patch 16, 34 GGUF fields - the same tower converted twice, differing only in F16 vs
+BF16 storage. The service keeps the verified unsloth F16; the provenance-matched ISTA BF16 is on disk as a
+drop-in alternative (one-line mmproj path change + restart).
