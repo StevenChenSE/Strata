@@ -146,3 +146,63 @@ Candidates, in the order they are cheapest to test:
 2. **The nanosleep pacing** above (`s_sleep(1)` vs `s_sleep(8)`).
 3. **Upstream's prefill changes** (+267 lines in `prefill.cpp`, plus their staging/chunking), against which our
    instrumentation was re-applied - our `--prefill 2048` may no longer mean what it did.
+
+## The gap, addressed: prefill was drift, and a real tg difference replaces it
+
+Chasing the merged build's -8.8 %/-11.8 % prefill deficit found the opposite.  A phase-table pair (same flags, 4K)
+had the merged build *faster*: 4,185.7 ms (978.1 tok/s) against 5,000.5 ms (818.7), and the composition showed
+where it came from - the merged build carries upstream's 0.1.25 prompt work:
+
+| phase (4K) | old | merged |
+| --- | ---: | ---: |
+| gdn (fused hyper-connections) | 859 ms | **591 ms** |
+| gemm gate/up | 783 ms | **613 ms** |
+| wait copy | 758 | 626 |
+| dequant | 334 | 292 |
+| qsa attn | 181 | 159 |
+
+A proper interleaved gate (`bench/tools/gate_merged.py 3`) then **passes**:
+
+| prompt | arm | pp median (range) | tg median (range) |
+| --- | --- | ---: | ---: |
+| 1K | old | 582.3 (570-595) | 48.4 (46.0-48.8) |
+| 1K | **merged** | **602.6** (464-614) | 46.0 (44.8-46.6) |
+| 4K | old | 823.4 (704-918) | 48.1 (44.5-48.8) |
+| 4K | **merged** | **971.6** (952-975) | 46.1 (42.1-47.2) |
+
+So **the identified gap does not exist**: it was host drift, and prefill is at parity or better (+4 % to +18 %
+depending on the run; a later 3-arm confirmation put it at +4.4 %, 971.2 against 929.9).  The 2-rep gate that
+reported -11.8 % was simply under-sampled on a box with this much drift.
+
+**What is real is the other axis: tg is 5-8 % lower**, reproducibly - the 3-rep gate (-6.9 %), the 3-arm
+confirmation (-6.5 %), and the flag isolation (-7 %) all agree.  The mechanism is in the draft accounting:
+
+| | old | merged |
+| --- | ---: | ---: |
+| rounds | 5 of 6 | 7 of 6 |
+| drafts accepted | 4 of 4 (1.000) | 2 of 2 (1.000) |
+| **tokens per round** | **1.80** | **1.29** |
+
+Both accept every draft they propose, but the merged engine **proposes far fewer per round** - it stops drafting
+earlier.  That is worth ~28 % of tokens/round, partly offset by its cheaper CPU pool (14.3 vs 21.5 ms/round,
+because it routes more experts over PCIe and is ring-limited instead), for a net -7 % on tg.
+
+**Two flag hypotheses tested and rejected**, both recorded so they are not re-tried:
+
+* `--pcie-frac` does not close it.  A 2-rep sweep looked like it did (0.15 giving tg 50.3), but an isolated
+  3-rep test at fixed `--adapt-every 2` put 0.05/0.15/0.30 all within noise (43.6/44.7/43.9) - the sweep was
+  under-sampled, which is exactly the trap this box sets.
+* `--adapt-every 0` (upstream's documented setting) makes tg much *worse* here: 34.1 tok/s, because without the
+  adaptive cache swaps the CPU pool grows to 36.3 ms/round and becomes the bottleneck.  Their setting suits their
+  mmap-based configuration, not ours.
+
+**One hypothesis of mine was wrong and is corrected here**: the merge replaced `data/draft_vocab.bin`
+(162,100 -> 425,196 bytes, with `draft_vocab_en.bin` added at exactly our old 162,100), which looked like the
+cause.  It is not: `src/core/mtp.cpp` reads the vocab from the **MTP runtime directory**
+(`<rt_dir>/draft_vocab.bin`), not from `data/`, so both binaries read the same file and the repo copy is
+irrelevant to a run.
+
+**Next lead for the tg difference**: since acceptance is 1.000 in both and only the proposal count differs, the
+draft-stop threshold is the place to look - `--spec-min-p` (0.5 here) and any changed stopping rule in their
+`mtp.cpp` (the merge added 21 lines there).  A one-flag test at a lower `--spec-min-p` should say whether the
+drafting recovers; if it does, the deficit is a configuration difference rather than a regression.
