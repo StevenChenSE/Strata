@@ -175,3 +175,42 @@ Two runs with the *same* configuration (cache 8192, `--prefill 2048`, `--max-new
 configuration, and report a spread rather than a single number.**  Best observed pp at 1K is
 **~400-420 tok/s** (ring 384, warm PLE, `--max-new 8`), i.e. at parity with the CUDA counterpart's 419
 on real prompts; the conservative same-protocol number (256 generated) is ~347-390.
+
+## Follow-up: "is RAM really slower than NVMe?" — no, it is latency-hiding
+
+The PLE table rows are 90 B (`PLE_ROW_BYTES = (160/32)*18`), 16 heads per token, so a 1,023-token chunk
+fetches **16,368 rows**.  The two arms' per-row costs differ 15x (9.6 us vs 140 us), which looks like
+"RAM slower than NVMe" — it is not.  They differ in pipelining:
+
+* `direct`: an I/O thread submits the whole batch with up to `--ple-inflight` outstanding reads, a
+  90 MB row cache absorbs repeats, and the dequant runs over one contiguous buffer.
+* `mmap`: `for (i < n) read_row(rows[i], ...)` — serial random access into a 27.5 GiB mapping (the code's
+  own comment: "SIXTEEN SERIAL PAGE FAULTS, MEASURED").  140 us/row is a *major* fault, so those pages
+  were not resident either: the same run commits a 46.84 GiB pinned arena and reads 52 GiB of shard 1,
+  which cannot leave 27.5 GiB of table in the page cache.
+
+Proof that depth, not medium, is the variable — cripple the *same* unbuffered reader:
+
+| direct-reader setting | prefill (1,023 tokens) |
+| --- | ---: |
+| `--ple-inflight 64` (default) | 2,542 ms |
+| `--ple-inflight 1` | 3,999 ms |
+| `--ple-inflight 1 --ple-row-cache 0` | 3,983 ms |
+| `--ple-row-cache 0` (depth 64) | 2,587 ms |
+
+Dropping the queue depth from 64 to 1 costs **+1.46 s**, the same order as the mmap arm's penalty;
+the row cache is worth ~2 %.  So "load the PLE into RAM" is not the question — *serial vs pipelined
+row access* is, and the default already pipelines.
+
+## `--pcie-frac`: measured worse, leave it automatic
+
+Forcing the PCIe miss share up (the engine auto-scales it to 0.30 from the 14.3 GB/s probe):
+
+| `--pcie-frac` | CPU experts/layer | pool ms/round | wait for rings | decode |
+| --- | ---: | ---: | ---: | ---: |
+| auto (0.30) | 1.35 | 7.70 | 23.1 | **30.30 tok/s** |
+| 0.55 | 0.88 | 7.33 | 25.2 | 28.33 tok/s |
+| 0.80 | 0.73 | 7.25 | 28.3 | 26.38 tok/s |
+
+Moving misses to the 14.2 GB/s link shrinks the CPU side but makes the GPU wait longer for staged
+experts — net negative.  Keep the probe-driven default.
