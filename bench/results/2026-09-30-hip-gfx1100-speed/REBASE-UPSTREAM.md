@@ -582,3 +582,30 @@ engine start - which re-reads 52 GB of model through the same cache beside the 4
 of it (Cached 54,543 -> 36,700 MiB). The PLE phase is ~100 ms in every run, warm or not; the loss is systemic
 residency cost, not read latency. Verdict unchanged: keep --ple-io direct. Prefill is the clear axis (direct's
 worst rep beats mmap's median); on decode the two overlap within this host's variance.
+
+### 1b. Vision: enabled and verified end to end on the HIP deployment
+
+Following 1 above, image support is now **live** on the gfx1100 service:
+
+* `strata-vision` built from `tools/vision` against the HIP-capable llama.cpp checkout with `STRATA_VISION_CUDA=OFF`
+  (CPU encoder, the default) - 0 compile errors, an 8.4 MB binary. No porting was required, as predicted: the helper
+  has no GPU code.
+* The missing asset turned out to exist: **`unsloth/Qwen3.8-Flash-Next-GGUF` ships `mmproj-F16.gguf`** (0.84 GiB,
+  projector `qwen3vl_merger`, `clip.vision.projection_dim` 2560) - downloaded to
+  `/home/jianwei/Strata-data/models/IQ3_S/mmproj-Flash-Next-F16.gguf`. Its projection width matches the text model's
+  `qwen4exp.embedding_length` (2560) exactly, and the model's own tokenizer carries the vision tokens
+  (`<|vision_start|>` 248053, `<|image_pad|>` 248056 = the engine's kImagePad, `<|vision_end|>` 248054): the model is
+  natively multimodal (`Qwen4ExpForConditionalGeneration` with a deepstack vision_config in the HF repo).
+* Standalone check: the helper speaks `ENC <image> <out>` and answers `READY 2560`, encoding test PNGs to valid SVE1
+  records (9 tokens, 3x3, n_embd 2560).
+* Wired into the service: `serve.json` gained a `"vision"` entry (`exe`/`mmproj`/`model` - the server spawns the
+  helper as a resident process speaking ENC at startup, `server.py:1723`) and the engine gained `--vision`.
+  `/metrics` now reports `images: true`.
+* **End-to-end correctness**: chat completions with OpenAI `image_url` parts (local file paths) - a red square
+  answers "Red", a blue square answers "Blue". Real multimodal inference through PNG -> strata-vision -> SVE1 ->
+  GENI -> m-RoPE -> text.
+
+Costs to know: with the vision entry present the server waits for the encoder's READY at startup - the helper loads
+the 52 GB text model (mmap) and runs a 4096-token CPU ViT warmup, so service start went from ~30 s to **~16.5 min**
+(the unit's TimeoutStartSec was raised to 1800 accordingly). The encoder is CPU-only; a GGML_HIP build of the helper
+is the later speed-up if image latency ever matters.
