@@ -565,3 +565,20 @@ split is 27.5 GB, the box already holds a 47 GiB pinned expert arena plus ~63 GB
 page cache invites reclaim pressure that stalls host-side work everywhere else. The direct path reads exactly the
 rows it needs and never holds the table. Verdict: the default is already right; "pinning it completely" is not
 viable at this table size on this box.
+
+### 3b. PLE addendum: the mmap arm re-tested with a properly warmed cache
+
+The A/B above interleaved the arms without a dedicated warm pass, so mmap's first repetition ran cold. Re-tested
+with a full sequential read of the 27.5 GB table first (11 s at 2.51 GiB/s), instrumenting /proc/meminfo, then three
+mmap repetitions and two direct:
+
+| arm | pp | tg | PLE phase |
+| --- | --- | --- | --- |
+| mmap, warmed, 3 reps | 941.1 / 955.0 / 1122.2 | 46.55 / 59.75 / 55.94 | 96-101 ms |
+| direct, 2 reps | 1187.9 / 1071.4 | 57.97 / 47.73 | 98-99 ms |
+
+The warming was real but partial and short-lived: page cache grew by only 20.2 GiB (not the full table), and one
+engine start - which re-reads 52 GB of model through the same cache beside the 47 GiB pinned arena - evicted most
+of it (Cached 54,543 -> 36,700 MiB). The PLE phase is ~100 ms in every run, warm or not; the loss is systemic
+residency cost, not read latency. Verdict unchanged: keep --ple-io direct. Prefill is the clear axis (direct's
+worst rep beats mmap's median); on decode the two overlap within this host's variance.
