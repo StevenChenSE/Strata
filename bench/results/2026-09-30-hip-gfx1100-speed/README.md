@@ -1663,3 +1663,33 @@ bandwidth-bound.  The quantised dp4a path is the right one for streamed experts.
 its own wrapper because the wrapper's command line contains that string - the AGENTS.md section 3 trap, this time
 producing false alarms rather than a self-kill.  The bracket form `pgrep -af "[c]lang"` does not, and the
 confirmation run above uses it.
+
+## Final evidence: medians per tier, and two corrections to how this file has been quoting numbers
+
+Every tier re-measured with repeats, recommended configuration (`--expert-cache auto --prefill 2048 --spec 4
+--spec-min-p 0.5 --adapt-every 2 --mtp ...`), no other work on the box (checked):
+
+| tier | pp runs (tok/s) | pp median | tg runs (tok/s) | tg median |
+| --- | --- | ---: | --- | ---: |
+| 1K | 396.6, 409.5, 410.5, 408.4, 408.5 | **408.5** (+-1.7 %) | 44.0, 44.7, 45.0, 45.1, 45.1 | **45.0** |
+| 4K | 648.5, 673.7, 673.7, 648.0, 564.8 | **648.5** (**+-10 %**) | - | - |
+| 32K | 686.8, 677.2, 677.4 | **677.4** (+-0.7 %) | 32.4, 32.2, 32.5 | **32.4** |
+
+**Correction 1 - the variance is 4K-specific.**  1K and 32K are tight (pp +-1.7 % and +-0.7 %, tg +-0.5 %), so
+the engine is stable and the heavy tail this file has been fighting is a property of the 4K tier, not of the
+machine in general.  That is a much sharper statement than the "environmental, +-11-47 %" I recorded earlier,
+and it means the earlier warnings apply to 4K comparisons specifically.  (Why 4K is the unstable one is still
+open: it is the only tier with exactly two chunks, but the resident/streamed counts were shown constant across
+six 4K runs, so it is not the adaptive tier.)
+
+**Correction 2 - decode throughput depends on the run length, so the tg ratios depend on protocol.**  The
+medians above used `--max-new 128` (1K) and `--max-new 32` (32K) and came out at 45.0 and 32.4 tok/s.  Earlier
+entries quoted 49.47 (256 tokens) and 37.87 (128 tokens) from single longer runs.  Both are real; the difference
+is the first rounds of a short run (the MTP prompt and draft warm-up) and the varying acceptance.  Since the
+counterpart's figures come from an unverified protocol, **the tg ratios in this file should be read as
+protocol-dependent**, and the honest comparison is on identical options and lengths.
+
+**And the counterpart cannot be re-verified here.**  This box has no NVIDIA hardware (no `nvidia-smi`, only
+`build-hip`; `rocm-smi` reports AMD cards), so the CUDA-side numbers (50.5/49.0 tok/s, 419/893 tok/s, ~1490 tok/s
+at 32K) are external and unverified in this session.  Everything measured *here* is solid and repeated; every
+*ratio* inherits that caveat.
