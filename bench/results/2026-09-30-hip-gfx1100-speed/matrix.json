@@ -30,5 +30,47 @@
     "spec_accept": 0.0,
     "vram_slots": 5341,
     "prompt": "13-token seed"
+  },
+  {
+    "run": "1k-random",
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "prefill_tok_s": 344.37,
+    "decode_tok_s": 26.01,
+    "decode_ms": 9841.3,
+    "prefill_ms": 2970.6,
+    "ttft_s": 3.079,
+    "spec_tokens_per_round": 1.02,
+    "spec_accept": 0.02,
+    "vram_slots": 5341,
+    "per_round": {
+      "wait_ms": 22.369,
+      "pool_ms": 14.165,
+      "commit_ms": 0.725
+    },
+    "prompt": "constructed: 1024 pseudo-random ids (seed 7)"
+  },
+  {
+    "run": "1k-random-nospec",
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "prefill_tok_s": 344.65,
+    "decode_tok_s": 26.72,
+    "decode_ms": 9580.1,
+    "prefill_ms": 2968.2,
+    "ttft_s": 3.075,
+    "spec_tokens_per_round": 1.02,
+    "spec_accept": 0.024,
+    "vram_slots": 5341,
+    "per_round": {
+      "wait_ms": 21.562,
+      "pool_ms": 14.208,
+      "commit_ms": 0.766
+    },
+    "prompt": "same, --spec-min-p 1.0"
   }
 ]

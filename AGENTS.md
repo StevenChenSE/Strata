@@ -1,34 +1,37 @@
 # AGENTS.md — working agreement for this repo (Strata → ROCm gfx1100 port)
 
-Branch `hip-gfx1100`. Current objective: get the HIP engine through **decode** on the RX 7900 XTX
-(gfx1100) — as of 2026-09-30 it is stuck in the speculation/verify window handshake. Read
-`.rocm-eval/PORT-STATUS.md` (running log) and `.rocm-eval/REVIEW-decode-hang.md` (external review:
-root causes, fixes applied, what is still open) **before touching anything**.
+Branch `hip-gfx1100`. Current objective: **HIP performance (pp/tg) against the CUDA counterpart.**
+Decode works as of 2026-09-30 (`39139d2` fixed the blocker — an unsigned underflow in
+`strata_hip_nanosleep`); the measured baseline and its breakdown are in
+`bench/results/2026-09-30-hip-gfx1100-speed/`, and the investigation history is in
+`.rocm-eval/REVIEW-decode-hang.md`. Read `.rocm-eval/PORT-STATUS.md` (running log) and that review
+**before touching anything**.
 
-## 1. Delegation policy (mandatory)
+## 1. Who does the work
 
-* **Delegate the hard work.** Implementation fixes that are more than a few lines, deep-dive
-  diagnosis, profile/wave analysis, and independent reviews go to a **subagent pinned to
-  `provider: jchen-icu`, `model: gemini-3.8-flash-high`** — the only Gemini route configured on this
-  machine (`~/.dsh/settings.yaml.imported`; the id is `gemini-3.8-flash-high`, there is no bare
-  `gemini-3.8-flash`).
-* Use the **`workflow` tool's `agent(prompt, { provider: "jchen-icu", model: "gemini-3.8-flash-high" })`**
-  hook for this. The plain `subagent`/`subagent_fork` tools have model selection switched off in this
-  session, so they cannot reach that route.
-* Give every delegated prompt **everything it needs**: it does not share the driving session's
-  context. Include the working directory, the exact files/line numbers, the build and run commands,
-  the evidence format you expect back, and the stop conditions.
-* **The driving agent hand-edits code only when the change is trivial** — a few lines, mechanical,
-  no design decisions (e.g. removing a wrong argument, deleting a duplicated increment, fixing an
-  offset). Anything that restructures control flow, adds a mechanism, or needs a judgement call is
-  delegated.
-* Keep driving: delegate → verify → decide the next step. Do not hand the whole objective to one
-  subagent and walk away.
+* **Investigation is the driving agent's job.** Deep dives, root-cause hunts, profiling attribution,
+  measurement design and deciding what to do next are yours. A subagent is not smarter than you: making
+  it the primary investigator costs a round-trip, throws away the context you have accumulated, and in
+  this port it produced a 13-minute silence with zero edits and confident reports built on misread logs.
+* **Implementation goes to a subagent**, pinned to `provider: jchen-icu`, `model: gemini-3.8-flash-high`
+  (the only Gemini route configured on this machine, `~/.dsh/settings.yaml.imported`; there is no bare
+  `gemini-3.8-flash`), via the `workflow` tool's
+  `agent(prompt, { provider: "jchen-icu", model: "gemini-3.8-flash-high" })` hook — the plain
+  `subagent`/`subagent_fork` tools have model selection switched off in this session. Give it the
+  finding, the exact file and line numbers, the numbers measured, the constraint list, and the evidence
+  format you want back; then review the result yourself per section 2 before trusting it.
+* **Exception: a truly mechanical edit of a few lines** (removing a wrong argument, deleting a duplicated
+  increment, fixing an offset, one-line arithmetic) may be made directly — waiting a round-trip for that
+  is waste. If it needs a design decision, a new mechanism, or more than a few lines, delegate it.
+* **A second look from a subagent is welcomed** on any load-bearing conclusion: independent verification
+  or adversarial review of your work. Ask it to **falsify**, not to confirm, and treat its answer as a
+  cross-check rather than an authority — it has already produced two confident false findings and missed
+  a compile break in this port.
 
 ## 2. Self-review is not optional
 
-**Always self-review a subagent's work before trusting it.** A subagent's summary is a claim, not a
-result. Before treating anything as done:
+**Self-review your own work, and treat a subagent's summary as a claim rather than a result.** Before
+believing anything is done:
 
 1. **Read the real diff yourself** (`git diff`, `git status`). Confirm the change is what the summary
    says, in the file you think, with no collateral edits.

@@ -55,3 +55,61 @@ against `pre(l)`'s tail.  The pool (66 ms of 98) is therefore the first target f
 * One run per cell; decode speed moves a few percent with the text (as the CUDA README says).
 * MTP weights were never fetched (`--mtp` would pull ~5 GB from HF, not authorised), so HIP speculation
   here comes from the engine's built-in drafter, not MTP.
+
+## Clean measurement: a non-repetitive prompt (drafting does not help)
+
+`/tmp/prompt_rand1k.txt` is 1,024 pseudo-random ids (seed 7, range 1000..150000), so the drafter cannot
+predict anything.  Two runs, 256 generated:
+
+| run | prefill (pp) | decode (tg) | speculation |
+| --- | ---: | ---: | --- |
+| default (`--spec 2`) | 344.37 tok/s (2970.6 ms) | **26.01 tok/s** (9841.3 ms) | 252 rounds of 4, 1.02 tok/round, drafts 5/254 |
+| `--spec-min-p 1.0` | 344.65 tok/s (2968.2 ms) | **26.72 tok/s** (9580.1 ms) | 250 rounds of 4, 1.02 tok/round, drafts 6/252 |
+
+So on text the drafter cannot predict, HIP does **26.0-26.7 tok/s** and pp is **344.4-344.7 tok/s**
+(three prompt shapes now agree to within 0.3 %, so pp is a solid number).  The 40.02 tok/s figure above
+is what a *perfectly predictable* prompt buys (3.95 tokens/round).
+
+## Attribution (my own, from the engine's per-round lines)
+
+Per round, wall ≈ `wait for rings + pool + commit` (the three terms sum to the wall within 2 %):
+
+| | random prompt | repetitive prompt |
+| --- | ---: | ---: |
+| wall per round | 39.1 ms | 98.4 ms |
+| wait for rings | 22.4 ms | 29.5 ms |
+| pool | 14.2 ms | 66.1 ms |
+| commit | 0.7 ms | 0.9 ms |
+| CPU experts / layer (distinct) | 2.82 | 12.04 |
+| PCIe experts / layer | 0.58 | 4.51 |
+
+1. **The two terms are serialised, not overlapped.**  The layer dependency chain is
+   `pre(l) -> pool(l) -> post(l) -> pre(l+1)`, and `post(l)` consumes the plan and the CPU rows the pool
+   produces, so the pool sits on the critical path; the only GPU work that can overlap it is `pre(l)`'s
+   tail (shared expert + quantize).  That is why wall ≈ wait + pool.
+2. **The pool scales with the number of CPU-resident experts** (14.2 ms at 2.8/layer, 66.1 ms at
+   12/layer ≈ 4.9 ms per round per expert-per-layer) and is **host-RAM-bandwidth-bound**:
+   `26.4-27.7 GB/s over the rows phases` against a machine that measures **45.4 GB/s** for a strided
+   read (my `mbr.c`) — so the pool is at ~60 % of the achievable read bandwidth.
+3. **Host facts that bound this** (measured): Ryzen 5 9600X, **6 physical cores / 12 threads**, 96 GB
+   RAM, `--pool-workers 0` = every physical core minus the host's = **5 workers**; THP is `madvise`
+   (not `always`) and `HugePages_Total = 0`, so the 46.84 GiB expert arena is on **4 KB pages**.
+4. **The tg gap against CUDA is mostly speculation, not round latency.**  CUDA's 50.5 tok/s at 2.77
+   tokens/round implies ~54.9 ms/round; HIP's random-prompt round is 39.1 ms.  HIP is *faster per round*
+   and loses on tokens/round (1.02 vs 2.77, i.e. MTP): the same round rate with CUDA's acceptance would
+   put HIP near 70 tok/s.  (MTP weights were never fetched — not authorised.)
+5. **pp is within 1.2x of CUDA** (344.5 vs 419) on a smaller, different GPU, with the prompt path
+   spending 161 ms of 2,921 ms in PLE and 25 ms DMA'ing 9,229 expert blobs.
+
+## Ranked levers (next experiments, cheapest first)
+
+1. `--expert-cache` size (4096 -> 8192/auto): more resident experts directly shrinks the pool term.
+2. `--pool-workers` (5 -> more) and/or huge pages for the arena (`madvise(MADV_HUGEPAGE)` on the
+   registered arena, or a configured hugetlb pool): the pool is at 60 % of measured read bandwidth.
+3. Overlapping pool(l) with GPU work: needs the plan/CPU-row hand-off redesigned so `post(l)` can start
+   its VRAM groups before the CPU rows are ready (the A/B/CPU doorbells already separate those waits in
+   principle — worth checking whether the GPU actually runs the VRAM groups before the CPU flag rises).
+4. pp: `--prefill` chunk size sweep, and the prompt path's per-stage attribution (no prompt-path
+   profiler was found; the verify window's `STRATA_VERIFY_PROFILE` does not cover it).
+5. Speculation: real-text acceptance (needs a tokenizer; `tools/strata_tokenizer.py` needs the `regex`
+   module, which is not installed and `pip` is unavailable) or MTP weights (not authorised).
