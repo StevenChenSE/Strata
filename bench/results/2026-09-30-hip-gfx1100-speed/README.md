@@ -1461,3 +1461,34 @@ Two facts stand out:
 If it holds, the lever is the same one the prefill's `wait copy` pointed at, one level down: **overlap the
 expert staging with the compute instead of lock-stepping per layer.**  The payload is large - the decode is
 41.5 tok/s against the counterpart's 50.5 at 1K and 37.9 against 49.0 at 32K.
+
+## Round 35: the decode cost model closes - PCIe transfer + exposed host-pool latency + math = the round
+
+Following `fetch_blobs` to its caller (verify.cpp:788) resolves the previous entry's puzzle and refutes the
+"50x kernel inefficiency" I briefly inferred:
+
+* `fetch_blobs` gathers the layer's **PCIe share**, which the profile reports as **3.22 distinct experts per
+  layer** (share 77/256 of the misses).  3.22 x 2.05 MB = 6.6 MB; at the link's 13 GB/s that is **507 us/layer**
+  against the trace's 503 us, i.e. **the kernel is the PCIe transfer and is already at the link rate** - a shader
+  reading host-mapped expert blobs, not a slow gather.
+* Independent probe (`/tmp/gather_probe.cu`, kept as evidence): the same kernel over *VRAM* sources reaches
+  **220-367 GB/s** and beats the copy engine's D2D at 166-258 GB/s, so the kernel itself is fine.
+* The doorbell waits (`streamOpsWait` 92.2 + `wait_flag_ge_kernel` 64.3 = 156.5 ms over 4 rounds) are
+  **39.1 ms/round**, and the host's pool work is 700 us/layer (33.6 ms / 48 layers).  **The GPU waits on the host
+  pool per layer instead of computing layer L while the pool produces L+1** - the serialisation hypothesis of the
+  previous entry, confirmed after I had talked myself out of it.
+
+The round then closes to within 1 %:
+
+| component | ms/round | evidence |
+| --- | ---: | --- |
+| PCIe expert transfer | 24.3 | trace 96.6 ms / 4 rounds = 24.2 |
+| doorbell / handshake waits | 39.1 | trace 156.5 ms / 4 rounds |
+| arithmetic (mmvq, down, gr_*) | ~22 | trace |
+| **sum** | **~85** | **measured round 85.7 ms** |
+
+So the tg lever is concrete and large: **overlap the host expert pool with the device compute** rather than
+lock-stepping per layer through the doorbells.  If the 33-39 ms of exposed pool/handshake time were hidden, the
+round would be bounded by the PCIe transfer plus arithmetic (~46 ms), which is why the payload looks like
+40 %+ - though the two transfers and the compute overlap imperfectly in practice, so treat that as an upper
+bound rather than a prediction.
