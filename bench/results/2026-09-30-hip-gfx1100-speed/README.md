@@ -1732,3 +1732,22 @@ counterpart's 893** rather than 73 %.
 **Measurement rule for the record:** 4K comparisons need medians of at least five runs with outliers identified,
 because a single external burst can add 25-70 %.  1K and 32K are stable within +-2 % and can be trusted from
 fewer runs.
+
+## Bounding the MMQ's headroom from data already in hand (the last item reopens)
+
+SUMMARY.md lists the expert MMQ kernels as the one remaining lever "with uncertain headroom, since these formats
+are unpacking-bound rather than int8-peak-bound".  That framing deserves a number, and the numbers I already have
+give one:
+
+    32K prefill: 262,555 expert visits x 2,046,400 B = 537 GB of expert weights
+    expert GEMM phases: gate/up 6,306 ms + down 3,247 ms = 9,553 ms
+    if the GEMM read those weights from VRAM per visit: 56 GB/s
+
+Against this card's ~800-960 GB/s of VRAM bandwidth, the expert GEMM stage is using **6-7 % of memory
+bandwidth** - so it is *not* memory-bound, and the headroom question is instruction and latency efficiency in
+the dp4a kernels, not bytes.  (The 537 GB itself crosses the PCIe link during the copy phases, at 11.3 GB/s; the
+GEMM then reads the staged blobs from VRAM, which is what the 56 GB/s figure measures.)
+
+That does not make the MMQ a good bet - an unpacking-heavy 2-bit dot product has a practical ceiling far below
+the int8 peak, and I have not measured where these kernels sit against it - but it does mean the "probably no
+headroom" framing in SUMMARY.md is a guess rather than a finding, and it is flagged as such.
