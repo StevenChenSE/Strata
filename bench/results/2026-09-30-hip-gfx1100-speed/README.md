@@ -1693,3 +1693,38 @@ protocol-dependent**, and the honest comparison is on identical options and leng
 `build-hip`; `rocm-smi` reports AMD cards), so the CUDA-side numbers (50.5/49.0 tok/s, 419/893 tok/s, ~1490 tok/s
 at 32K) are external and unverified in this session.  Everything measured *here* is solid and repeated; every
 *ratio* inherits that caveat.
+
+## The 4K variance is host-side interference - the last open measurement question, closed
+
+Differential diagnosis: five 4K runs with the recommended configuration, capturing the engine's own counters and
+phases.
+
+| run | pp ms | streamed | resident | wait copy | dequant |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 6,039.6 | 27,493 | 15,491 | 2,039 | 388 |
+| 1 | 6,044.5 | 27,469 | 15,495 | 2,055 | 388 |
+| 2 | 6,081.9 | 27,497 | 15,483 | 2,064 | 389 |
+| 3 | 6,054.1 | 27,510 | 15,485 | 2,025 | 400 |
+| 4 | **7,621.4** | 27,521 | 15,489 | **2,596** | **604** |
+
+The slow run moved **nothing on the GPU side** - the same expert counts, the same residents, no tier adaptation -
+and inflated exactly the two phases that wait on the stream (`wait copy` +27 %, the gather's idle +52 %).  A
+control set with `--spec 2` (no MTP) and a sampling run that watched the sibling GPUs both add to the picture:
+the control set was tight (5,811.7-6,064.2 ms, +-2.1 %), and the one badly slow run in the sampled set
+(10,326.8 ms, +71 %) showed **no sibling GPU activity**.
+
+So the cause is not the sibling GPU sharing the slot, and not anything the engine controls: it is **host-side
+interference** - another process taking CPU or host-memory bandwidth, which slows the expert stream while
+leaving every GPU-side counter identical.  That is precisely the mechanism AGENTS.md recorded from the other
+direction ("a 5 GB download alongside a 4K prefill moved it from 8,275-8,517 ms to 10,159 ms"), and it explains
+the tier dependence: 1K is too short to catch a burst, 32K's 47 s averages it out, and 4K sits in between with
+the largest streaming share per unit time.
+
+**Corrected 4K number.**  The 648.5 tok/s median recorded last round came from a set with two outliers.  With
+the tight clusters (4 of 5 runs within 6,040-6,082 ms, plus the no-MTP control set at 5,842 ms) the honest
+figure is **~676 tok/s with the recommended configuration** (and ~701 for the no-MTP control), i.e. **76 % of the
+counterpart's 893** rather than 73 %.
+
+**Measurement rule for the record:** 4K comparisons need medians of at least five runs with outliers identified,
+because a single external burst can add 25-70 %.  1K and 32K are stable within +-2 % and can be trusted from
+fewer runs.
