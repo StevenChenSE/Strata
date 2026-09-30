@@ -407,3 +407,49 @@ than a reason to reject it - and if it is fixed the merge would be at least our 
 upstream's prefill and features.  The specific race is a hypothesis, not yet shown: it would be confirmed by
 forcing the synchronisation in the verify path (or by instrumenting what the draft head actually reads) and seeing
 the flip disappear.
+
+## The merged build's decode instability, traced to expert placement - and fixed by a flag
+
+Kept digging with `STRATA_VERIFY_DEBUG=1` traces (identical line counts, 11,302, so only *values* differ) and the
+existing logs.  The first real difference between a good and a bad repetition is the **prefill line itself**:
+
+```
+good: prefill 32766 tokens in 16 chunks, 26033.1 ms (1258.6 tok/s); streamed 247,628; resident  32,956; PLE 237.3 ms
+bad:  prefill 32766 tokens in 16 chunks, 31464.7 ms (1041.4 tok/s); streamed 258,911; resident 127,319; PLE 1006.0 ms
+```
+
+**The host-side variability is shared, so it is not the discriminator.**  Our own build's residency swings just as
+widely (40,685 -> 106,344) and its PLE phase ranges 235 -> 1,164 ms, yet it emitted all-zeros with 1.000 acceptance
+in all six reps examined.  Master is even tighter: streamed/resident are byte-identical in every repetition
+(69,900 / 28,168 at 32K, 16,576 / 7,708 at 4K), and its per-round acceptance histogram is identical too
+(`0:19 1:51 2:1 3:1`), because `--pcie-frac 0` removes the PCIe-share variability from the split.
+
+**What differs is what the counters mean.**  Our own source says it, at `src/prefill/prefill.cpp:335`:
+
+> a streamed run lends the prompt path exactly the slots a resident one does (**a lent expert runs on the CPU,
+> which rounds differently**: without this an A/B compares two expert placements as well as two KV placements)
+
+So any difference in *which* experts are served from the cache versus lent to the CPU changes the rounding, hence
+the logits - and because draft acceptance is a hard threshold, the visible effect is a flip between 1.000 and
+~0.81 acceptance with different emitted tokens.  The merged build showed two *tight, repeatable* prefill modes
+(`resident 32,956` vs `127,319 / 127,321`), i.e. two expert placements, and its answers flipped with the mode.
+Our build varies continuously but stayed on placements that do not cross the token boundary; master never varies
+at all.
+
+**The fix is a flag, not a code change.**  Running the merged build with `--pcie-frac 0` (as master does) removes
+the variability:
+
+| merged, `--pcie-frac 0 --adapt-every 2` | output | acceptance | tok/round | resident | tg |
+| --- | --- | ---: | ---: | ---: | ---: |
+| rep 1 | all-0 | 1.000 | 1.94 | 81,153 | 54.95 |
+| rep 2 | all-0 | 1.000 | 1.94 | 81,163 | 54.87 |
+| rep 3 | all-0 | 1.000 | 1.94 | 89,537 | 60.04 |
+
+Three identical answers, 1.000 acceptance every time, and **54.9-60.0 tok/s, i.e. parity with our branch's
+59.6-61.8** - so the merged build is not slower on decode once its expert placement is made deterministic; it was
+flipping.  (`--adapt-every 0` is also deterministic but slow, 36-39 tok/s, because a frozen placement pushes more
+work onto the CPU.)
+
+This changes the adoption picture: the merge needs no bug fix for decode, only `--pcie-frac 0` in its
+configuration - at the cost of whatever prefill the PCIe share was buying, which has *not* been measured for the
+merged build at 32K and is the next thing to check.
