@@ -104,7 +104,16 @@ int main(int argc, char** argv) {
     // what is really left; allocating ~1 GB later, on a GPU the engine has filled, made Windows page GPU memory and
     // the engine crawl to a standstill.  (A square image well above any cap; mtmd scales it to the token limit.)
     {
-        const uint32_t side = 2048;
+        // STRATA_VISION_WARM_SIDE shrinks the warmup square: 2048 px scales to the 4096-token cap, a full ViT pass
+        // that dominates startup when the encoder runs on the CPU (~10 min measured).  1024 px ~ 1024 tokens -
+        // mtmd's own Qwen-VL minimum - costs about a quarter of the compute and still pages the mmproj, grows the
+        // work buffers and spins the thread pool.  The buffer rationale above is CUDA-specific; a CPU-only helper
+        // allocates ordinary RAM the engine does not compete for.
+        uint32_t side = 2048;
+        if (const char* w = std::getenv("STRATA_VISION_WARM_SIDE")) {
+            const unsigned long v = std::strtoul(w, nullptr, 10);
+            if (v >= 256 && v <= 8192) side = (uint32_t) v;   // out-of-range or garbage keeps the default
+        }
         std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
         mtmd_bitmap* bm = mtmd_bitmap_init(side, side, rgb.data());
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();

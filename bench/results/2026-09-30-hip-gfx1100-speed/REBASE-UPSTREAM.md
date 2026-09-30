@@ -616,3 +616,19 @@ mmproj-Flash-Next-BF16-ISTA.gguf and compared against the unsloth F16 in use: id
 projection_dim 2560, image 768 / patch 16, 34 GGUF fields - the same tower converted twice, differing only in F16 vs
 BF16 storage. The service keeps the verified unsloth F16; the provenance-matched ISTA BF16 is on disk as a
 drop-in alternative (one-line mmproj path change + restart).
+
+### 1c. Vision: switched to the provenance-matched mmproj, and startup cut 995 s -> 93 s
+
+The service now uses the ISTA-DASLab BF16 mmproj (the quant's own repo) instead of the unsloth F16 copy, which is
+deleted; a completion still verifies and the red/blue discrimination still passes ("Red" / "Blue"). Config:
+`~/.config/strata/serve.json` vision.mmproj -> mmproj-Flash-Next-BF16-ISTA.gguf.
+
+The 10-minute vision load was the helper's CPU ViT warmup at the 4096-token cap (`strata_vision.cpp` hardcoded a
+2048 px warmup square, which mtmd scales to the cap; the model load itself is vocab-only mmap and costs seconds).
+`tools/vision/strata_vision.cpp` now reads `STRATA_VISION_WARM_SIDE` (default 2048, upstream behavior unchanged;
+bounds 256-8192) and the service sets 1024 - mtmd's own Qwen-VL minimum. Verified: standalone warmup reports
+"1024 image tokens" and the whole helper cycle (model load + warmup + one encode) dropped from >600 s to **47 s**;
+service startup dropped **995 s -> 93 s** (10.7x). The smaller warmup still pages the mmproj, grows the work
+buffers and spins the thread pool; only the worst-case graph shape is deferred to the first big image, which is a
+CPU allocator cost, not the GPU-buffer concern the original warmup comment guards against (that rationale is
+CUDA-specific and this helper is CPU-only).
