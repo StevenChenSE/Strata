@@ -11,11 +11,17 @@ Recommended configuration throughout:
 
 | metric | this port (repeated median) | counterpart | ratio |
 | --- | ---: | ---: | ---: |
-| pp @1K | **408.5 tok/s** (5 runs, 396.6–410.5) | 419 | **97.5 %** |
-| pp @4K | **676 tok/s** (tight cluster of 5) | 893 | **76 %** |
-| pp @32K | **677.4 tok/s** (3 runs, ±0.7 %) | ~1,490 | 46 % |
-| tg @1K | **45.0** (128 tokens) / **49.47** (256 tokens) | 50.5 | 89–98 % |
-| tg @32K | **32.4** (32 tokens) / **37.87** (128 tokens) | 49.0 | 66–77 % |
+| pp @1K | **602.5 tok/s** | 419 | **144 %** |
+| pp @4K | **1,016 tok/s** | 893 | **114 %** |
+| pp @32K | **1,079.2 tok/s** | ~1,490 | 72 % |
+| tg @1K | **46.5** (128 tokens) | 50.5 | 92 % |
+| tg @32K | **46.3** (32 tokens) | 49.0 | **94 %** |
+
+These are the **PCIe 4.0 ×16** numbers, measured after the second card was removed from the shared slot (2 MB
+H2D blobs measure 25.8 GB/s against 13.5 at ×8).  On the old ×8 link the same configuration gave pp 408.5 /
+676–707 / 677.4 and tg 45.0 / 32.4, so the link was the long-context ceiling: lifting it moved prefill by
++44–59 % and 32K decode by +43 %.  The 4K prompt had to be regenerated and routes slightly differently, so that
+tier's gain is the least like-for-like of the three.
 
 Two caveats that matter more than the digits:
 
@@ -106,6 +112,9 @@ waits that are already satisfied at enqueue time, so only stalls longer than 58 
 host's (per-chunk PLE/embedding work, and interference from whatever else this box is doing, which is also what
 makes the 4K tier the unstable one).
 
-So the remaining gaps are the PCIe 4.0 ×8 link (running at 80 % of its measured peak while busy) and this
-machine's host side.  Everything else was taken, refuted, or measured.
+So the remaining gaps were the PCIe link and this machine's host side - and that prediction was then tested by
+removing the second card from the shared slot.  On the full ×16 link the same configuration gives the numbers at
+the top of this file: **+47 % prefill at 1K, +44–50 % at 4K, +59 % at 32K and +43 % on 32K decode**, with the 4K
+`wait copy` phase collapsing from ~2,000 ms to 378 ms.  The link was indeed the long-context ceiling; what
+remains now is the host side and the ×16 link itself.  Everything else was taken, refuted, or measured.
 
