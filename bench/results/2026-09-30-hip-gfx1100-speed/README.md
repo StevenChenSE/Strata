@@ -737,3 +737,24 @@ from, and its notes reach the same conclusions this benchmark did:
 Delegated next: replace the HIP side of `Gemm::f16` (gemm.cu, currently `cublasGemmEx`/rocBLAS at 14 TFLOPS)
 with a WMMA GEMM modelled on that reference, keeping the existing `dequant_f16` staging and verifying both
 numerics against rocBLAS and throughput at the engine's own shapes.
+
+## Round 18: the long-prompt lever is OVERLAP, not bytes (correcting my own framing)
+
+I had described the 32K prefill as "10.5x re-streaming redundancy", implying waste to recover.  It is not
+waste - it is forced by the VRAM cache size:
+
+* the cache held 9,260 slots = **193 of the 512 experts per layer**, so *every* chunk must stream at least
+  512 - 193 = 319 experts per layer;
+* over 16 chunks that floor is 245,056 blobs, and the measured 258,880 is just **1.06x the floor**;
+* the floor is 501 GB = **35.3 s at 14.2 GB/s**, inside a 62.9 s prefill.
+
+So the link's duty cycle is at most **58 %**, i.e. the link is **idle ~42 % of the prefill** while the GPU
+computes, and the prefill is roughly 36 s of unavoidable DMA plus ~26 s of compute with poor overlap.
+**Perfect overlap would give ~max(36, 26) = 36 s -> pp ~910 tok/s instead of 521-572 (+65 %)** at 32K.
+
+That is the same conclusion the sibling project recorded for this GPU ("the copy engine is idle during the
+GEMM; only two paths remain: reduce bytes or overlap the copies with compute"), and here the byte side is
+already at 1.06x of its floor - so for long prompts the software lever is **pipelining the expert streaming
+under the compute** (the routing for layer l+1 is only known after layer l's MoE output, so a useful
+prefetch has to be predictive - e.g. stream what the expert profile says layer l+1 is likely to need while
+layer l computes, and correct after the router runs).
