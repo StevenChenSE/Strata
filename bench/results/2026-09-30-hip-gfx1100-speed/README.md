@@ -1339,3 +1339,34 @@ session.
 **How to read earlier 4K numbers:** the *within-run phase attributions* are sound (a 5.5x change in `qsa attn`,
 a 2-5x change in `hc read`), but 4K *totals* carry a +/-11 % host-side spread, so single-pair 4K comparisons in
 this file are weaker than the 1K ones (whose WMMA arms held within 1.4 %).
+
+## Round 31: the host setup is the embeddings (stable), and my Round-27 variance attribution was wrong
+
+Split the "chunk setup" with two extra counters (kept; they are cheap and only print under
+`STRATA_PREFILL_TIMING`):
+
+| rep | total | embeddings | stream plan + first issue |
+| --- | ---: | ---: | ---: |
+| 1 | 5,971.6 ms | 239 ms | **0 ms** |
+| 2 | **8,712.6 ms** | 202 ms | **0 ms** |
+| 3 | 5,937.4 ms | 206 ms | **0 ms** |
+
+Two conclusions:
+
+* The setup is the **embedding gather** (202-239 ms, stable) - *not* the PLE rows (the print's label is stale) and
+  not the stream plan, which is 0 ms at this chunk size.
+* **The Round-27 attribution was wrong.**  That entry blamed the slow runs on a 3.5x larger host chunk setup
+  (720 vs 202 ms) from a single pair.  Here rep2 ran **8,713 ms - a 47 % outlier - with a completely normal
+  setup (202 ms)**, so the correlation did not hold.  The host setup is not the variance source.
+
+Also tested and rejected: `--ple-row-cache` 1M/4M/16M rows (no systematic effect; one 4M run spiked to a 966 ms
+PLE), and sampling `pp_dpm_sclk` during runs (inconclusive - it reported level 1 as 0-185 MHz while the same
+runs took 6 s, so it was not reading the active card's clock).
+
+**Consequence for reading this file.**  The 4K prefill's run-to-run spread is much larger than the ~3 % assumed
+early on: over the last twelve 4K runs the totals were 5,937-8,713 ms, i.e. up to +47 %.  Single-pair 4K
+comparisons are therefore weak evidence, and this applies retroactively to a few entries above - notably the
+Round 21 WMMA-attention numbers (6,045 vs 6,611 ms, +9.4 %), which are *inside* the spread.  What remains solid
+is the *within-run phase evidence*, where the same change moved `qsa attn` from 1,115 ms to 201 ms (a 5.5x
+change, and the phase shares are computed against the run's own total).  1K comparisons are unaffected: the
+WMMA arms there held within 1.4 %.
