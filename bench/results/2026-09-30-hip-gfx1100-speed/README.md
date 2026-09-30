@@ -2266,3 +2266,53 @@ acceptance, so its 60.7 tok/s and the size of its decode advantage over master a
 The 32K *ranking* is still fair - all three arms ran the identical prompt, interleaved, with the order rotated -
 but the absolute numbers carry the topic-range caveat, which is why the three-way was re-run on the mixed
 33K-token prompt (`33k_mixed.txt`).
+
+## An external harness: llama-benchy against the engine's own server
+
+Tried `uvx llama-benchy` as an independent, externally-reproducible benchmark of the server path - which had never
+been exercised in this session.  Getting there needed three things that did not exist before:
+
+1. **uv.**  This box has no pip, so the tool runner was absent; `curl -LsSf https://astral.sh/uv/install.sh | sh`
+   installs `uv`/`uvx` to `~/.local/bin` with no sudo.  Worth knowing generally: uv also removes the long-standing
+   "cannot run the Python tooling here" limitation for anything else that needs a package.
+2. **The server, whose dependency set nobody had resolved.**  `serve/server.py` imports `strata_tokenizer`, which
+   needs the third-party `regex`; it also needs `jinja2`, `tokenizers` and `numpy`.  Run it with an ephemeral
+   environment rather than a venv: `uv run --no-project --with regex --with jinja2 --with tokenizers --with numpy
+   python -m serve.server --engine strata --config /tmp/strata-hip-8095.json --port 8095`.  It printed
+   `ready: http://127.0.0.1:8095/v1 ... context 65536 tokens` and `/v1/models` answered correctly.
+3. **A server config** (`/tmp/strata-hip-8095.json`): exe = `build-hip/strata-hip`, args = `--serve` plus this
+   project's tuned flags (`--prefill 2048 --spec 2 --adapt-every 2 --pcie-frac 0.30 --kv int8 --max-context 65536`
+   and the usual pack/model/mtp paths), tokenizer = the pack's `tokenizer/` directory, model_name, port.  Note the
+   engine's own `--serve` flag exists on this branch, so our build can be served as-is.
+
+Then, with the server up:
+
+```
+uvx llama-benchy --base-url http://127.0.0.1:8095/v1 --model local/iq3_s \
+  --served-model-name qwen3.8-flash-next-iq3_s \
+  --tokenizer /home/jianwei/Strata-data/packs/iq3_s/tokenizer \
+  --pp 2048 --tg 32 --depth 0 4096 8192 32768 --exact-tg --runs 1 --format md
+```
+
+`--model` must look like an HF repo id even when `--tokenizer` is given, hence the `local/iq3_s` placeholder plus
+`--served-model-name` for the API field.
+
+**It works, and it passes its own coherence test** - but two of its numbers must be read carefully:
+
+* **It fell back to the gpt2 tokenizer.**  Our pack's `tokenizer.json` is not in the format the `tokenizers`
+  library accepts (`'added_tokens' ... did not match any variant of untagged enum ModelUntagged`), and llama-benchy
+  does not stop - it prints `Falling back to 'gpt2' tokenizer as approximation`.  So its token counts are
+  approximate rather than ours.
+* **Its `pp` column is not usable against this server.**  It reports 284,744-527,480 tok/s because it divides the
+  requested token count by a 7 ms "time to first response token" - the SSE stream opens before the prefill has
+  finished.  The usable prefill figure is `e2e_ttft`: 2,419 ms for pp2048 at depth 0, and **31,822 ms for the
+  depth-32768 case**, i.e. about 35K tokens at ~1,100-1,300 tok/s, which agrees with the hand measurements.
+
+The decode column is valid (`--exact-tg` forces the requested length): **40.57 t/s at depth 0, 49.42 at 4K, 52.63
+at 8K, 50.65 at 32K** (peaks 41.88 / 51.02 / 54.33 / 52.29).  These are lower than this file's hand-measured 32K
+figure of 60.7 because the protocol differs - 32 generated tokens here against 128, and decode throughput is
+run-length dependent, as recorded earlier.
+
+To make llama-benchy fully comparable one would have to emit a `tokenizers`-compatible tokenizer for the pack
+(from its `vocab.json`/`merges.txt` plus the pre-tokenizer pattern in `tools/strata_tokenizer.py`); until then,
+read `e2e_ttft` for prefill and the tg column for decode.
