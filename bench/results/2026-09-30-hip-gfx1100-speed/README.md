@@ -559,3 +559,39 @@ resident, so the 2048-token chunk fits *and* the expert pool stays small.  Resul
   `--prefill 512` cost.
 
 Recommended configuration: `--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --mtp <rt>`.
+
+## Round 13: why pp is behind - rocBLAS on gfx1100 runs at ~14 TFLOPS (no WMMA path)
+
+1K prefill kernel attribution (my `bench/tools/prof_prefill.py` on a rocprofv3 trace):
+
+| group | ms | % | launches |
+| --- | ---: | ---: | ---: |
+| **rocBLAS GEMM** (the dense projections) | 731.4 | **42.9** | 998 |
+| **MMQ** (the expert GEMMs) | 526.8 | 30.9 | 24,191 |
+| dequant (weight -> f16) | 153.3 | 9.0 | 300 |
+| attention | 106.7 | 6.3 | 24 |
+| runtime copy/fill | 72.5 | 4.2 | 12,637 |
+| gdn recurrence | 62.8 | 3.7 | 36 |
+
+`Gemm::native` (gemm.cu:96) dequantizes each dense weight to FP16 in scratch and then calls rocBLAS
+(`Cijk_..._HSS_...`).  `bench/tools/rocblas_f16_probe.cu` measures what rocBLAS itself can do on this
+GPU, with the engine's own shape convention:
+
+| shape | ms | TFLOPS |
+| --- | ---: | ---: |
+| 4096^3 | 10.19 | 13.5 |
+| q_proj-like M=12288 N=1023 K=2560 | 4.50 | 14.3 |
+| o_proj-like M=1023 N=2560 K=12288 | 4.58 | 13.9 |
+| ssm/gate-like M=5120 N=1023 K=2560 | 1.86 | 14.2 |
+
+**~14 TFLOPS regardless of shape.**  The 7900 XTX's FP16 WMMA peak is ~123 TFLOPS, so rocBLAS is on a
+SIMT/VectorALU path - RDNA3 has no MFMA, and the Tensile kernels selected for gfx1100 are not WMMA ones.
+`ROCBLAS_USE_HIPBLASLT=1` does not change it (13.2 TFLOPS), so this is not an env-var fix either.  The CUDA
+counterpart's cuBLAS would run these on tensor cores at several times that rate, which is a large part of
+why its 1K prompt is 419 tok/s against this port's 328-420 and its 4K prompt is 893 against 495.
+
+Consequences for the objective: the port's remaining pp gap is **not a port bug**.  It is (a) the PCIe 4.0
+x8 link, which carries 47 % of the 4K prefill's bytes, (b) rocBLAS's missing WMMA path for the dense
+projections (43 % of the 1K prefill), and (c) the emulated `mma16816` prompt attention (13 % at 4K).
+Only (c) and a hand-written WMMA GEMM would be addressable in software, and both are projects rather than
+patches.  ROCm issue worth noting for the record: `rocblas` fp16 GEMM on gfx1100, any shape, ~14 TFLOPS.
