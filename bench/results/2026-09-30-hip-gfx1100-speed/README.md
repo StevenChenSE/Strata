@@ -1492,3 +1492,34 @@ lock-stepping per layer through the doorbells.  If the 33-39 ms of exposed pool/
 round would be bounded by the PCIe transfer plus arithmetic (~46 ms), which is why the payload looks like
 40 %+ - though the two transfers and the compute overlap imperfectly in practice, so treat that as an upper
 bound rather than a prediction.
+
+## Round 36: the decode's shader fetch is a deliberate robustness choice, not an oversight - and a delegation was wasted
+
+Following the previous entry's lever ("move the PCIe expert transfer off the blocking shader onto the copy
+engine"), I delegated that implementation - then found, by reading the call site, that **the copy-engine path
+already exists** as an option and the shader is the *deliberate* default:
+
+    src/program/generate.cpp:3163
+    // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
+    // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
+    ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+
+`--pcie-mode` takes `auto | dma | kernel | direct`; `auto` and `kernel` select the shader `fetch_blobs` (mode 2),
+`dma` selects mode 0, `direct` mode 1.  Measured (64-token decode, 1K): **dma 44.65 tok/s, kernel 42.22,
+auto 41.89, direct 41.03**, with the window's `wait for rings` falling 36.5 -> 31.8 ms - so the DMA path really
+is faster, as the mechanism predicted.  At 32K (32 tokens): dma 34.30 vs auto 32.91 tok/s (+4.2 %); at 1K on
+that shorter sample they were level (41.08 vs 41.32).
+
+**But it must not become the default.**  Issue #31 is a host hang inside `cudaMemcpyAsync` on a driver lock, and
+the shader path exists precisely to avoid a host CUDA call there.  The trade the comment records (~1-3 % decode)
+matches what I measured (~0-6 %), so there is nothing to fix by flipping the default - it would reintroduce a
+hang to chase a few percent.
+
+Two process notes, both mine:
+
+* The delegation (`workflow-19`, "move the fetch to the copy engine") was **redundant** - it was asked to build
+  what `--pcie-mode dma` already provides.  I killed it.  AGENTS.md's "prefer an A/B switch that already exists"
+  applies to options the codebase already has, and I searched the wrong place (the kernel) instead of the
+  command-line surface.
+* The default flip I was about to make was **wrong**, and the call-site comment is what stopped it.  Reading the
+  comment above a line before changing that line is cheap; shipping a hang is not.
