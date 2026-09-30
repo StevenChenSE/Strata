@@ -285,3 +285,40 @@ is 11.8 ms against 155.1 ms, its drafting is 0.875 against 1.758 ms/round, its e
 (upstream's deliberate draft-head reservation), and it carries upstream's six releases of engine work - the k8v4
 KV option, the hipBLASLt path (inert on this ROCm), the setup/server changes and their HIP test suite.  Those are
 categorical gains; the throughput edge over master is not yet one.
+
+### Why the hipBLASLt table is inert here, exactly
+
+`create_hipblaslt_state()` in their `src/prefill/gemm.cu:121-156` decides all of it:
+
+```c
+const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
+if (!path || !*path) return nullptr;                        // no table -> no hipBLASLt path at all
+...
+if (!state->table.load(path, arch, version, error)) {
+    std::fprintf(stderr, "prefill gemm: %s; using hipBLASEx\n", error.c_str());
+    return nullptr;                                         // table rejected -> whole path abandoned
+}
+std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)\n", ...);
+```
+
+Three consequences worth being precise about:
+
+1. **The tuned table is the only way into the hipBLASLt path.**  There is no untuned or heuristic hipBLASLt
+   mode: if `STRATA_HIPBLASLT_TUNING` is unset, or the table fails to load, `nullptr` is returned and the dense
+   prefill GEMM runs through `hipblasGemmEx` - what their own messages call "hipBLASEx" (plain hipBLAS).  So on
+   this box **hipBLASLt is not used at all**, not merely untuned.
+2. **The version check is deliberate and correct.**  The shipped tables declare
+   `STRATA_HIPBLASLT_TUNING_V1 gfx1100 100100` (31 rows) and `... 100200` (27 rows), and their own header comment
+   says "solution IDs are scoped to this hipBLASLt version and device architecture".  A solution ID names a
+   specific kernel and workspace configuration inside one library build, so replaying a 1.1.0 table against 1.4.1
+   can select a kernel that no longer exists in that form.  Our runtime reports **100401** (= 1.4.1, matching
+   `libhipblaslt.so.1.4` and the header's MAJOR 1 / MINOR 4), so **neither shipped table matches** - switching to
+   the 100200 file would not help either.
+3. **It handicaps their arm, not ours.**  Per the docs their published benchmark *did* use the table, so their
+   numbers are not what was measured here; and because their master has no WMMA path while the merged build calls
+   our WMMA kernels first, the missing hipBLASLt path costs their master far more than it costs the merged or our
+   builds.  My "ours/merged is faster" comparisons are therefore conservative toward them.
+
+To make it engage one would either use a ROCm whose hipBLASLt is 1.1.0/1.2.0 - which is what their
+`setup.sh --backend hip` arranges by installing a pinned ROCm from TheRock wheels, ~10 GB, no sudo - or re-tune on
+1.4.1 with their own `tools/hip/tune_hipblaslt.cpp` (419 lines, vendored here) and write a 100401 table.
