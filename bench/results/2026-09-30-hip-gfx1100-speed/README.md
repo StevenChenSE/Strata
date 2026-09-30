@@ -2147,3 +2147,61 @@ Two conclusions:
 1K 602.5 and 4K 1,016; today they give 528.6 and 867.4 - 12-15 % lower, which is larger than the within-session
 spread (the 1K range here is 524-531).  So absolute prefill figures must be quoted as a range and compared only
 within one session; the earlier note said ~10 % and this revises it to ~12-15 %.
+
+## Upstream's own gfx1100 backend (origin/main) versus ours
+
+Upstream merged a *different* AMD backend (`470a283 Merge the AMD HIP backend (PR #121 ...)`, plus
+`e5dcc0c AMD: hipBLASLt table for 100200 ... +42-59% prompt speed on the 7900 XTX`), documented in
+`docs/AMD_HIP.md` / `docs/AMD_HIP_PERFORMANCE.md`, latest commit 2026-09-30 11:18 +0200.  Our branch is 83 commits
+ahead / 46 behind that work, on an older base.  So this is their port against ours, on our box, with our model.
+
+Built their `strata` in a git worktree (`/tmp/strata-main`, so our tree is untouched).  Two build facts: their
+CMake needs `-DCMAKE_PREFIX_PATH=/opt/rocm` (our cached `hip_DIR` alone no longer resolves their `find_package`),
+and their pinned ggml is `3cf03257` whereas our llama.cpp checkout is `4da633776` - a substitution their docs
+warn against, recorded as a caveat rather than hidden.
+
+**Their documented mmap configuration cannot run on our pack.**  It uses `--mmap-experts --resident-cpu-experts`,
+which needs the pack's `experts.bin`; our pack has only `dense.bin`, `index.txt`, `native_experts.txt` and
+`tokenizer/`, because our packing references the GGUF instead of copying the experts.  Both arms therefore ran the
+**pinned arena** (their log confirms `expert arena: cudaHostRegister PORTABLE ok`).
+
+**And their calibrated hipBLASLt table does not engage here**:
+`prefill gemm: hipBLASLt version mismatch: file=100100 runtime=100401; using hipBLASEx`.  Their headline claim is
+specifically the hipBLASLt path against their own fallback, and on our ROCm (7.2.4 / hipBLASLt 100401) the guard
+correctly refuses it.  So their arm here is their *fallback*, not their published configuration.
+
+Interleaved x3, same pack/model/prompts, `--max-context 32768 --kv int8 --max-new 128 --spec 4`, each arm on its
+own documented/tuned flags (ours `--prefill 2048 --pcie-frac 0.30 --adapt-every 2`; theirs `--prefill 8192
+--pcie-frac 0 --adapt-every 0 --kv-resident 32768 --vram-reserve-mib 1024 --pool-workers 8` + `STRATA_PREFILL_MMQ=1`
++ `STRATA_IO_THREADS=32`):
+
+| prompt | arm | pp median (range) | tg median (range) |
+| --- | --- | ---: | ---: |
+| 1K | **ours** | **577.0** (501-600) | **47.6** (46.4-50.0) |
+| 1K | upstream | 455.8 (359-464) | 43.4 (41.1-44.4) |
+| 4K | **ours** | **922.4** (800-933) | **49.5** (46.5-51.2) |
+| 4K | upstream | 758.0 (757-772) | 41.8 (41.5-44.4) |
+
+**Ours is faster on both axes**: prefill +26.6 % at 1K and +21.7 % at 4K, decode +9.7 % and +18.4 %, with ranges
+that barely overlap.  Swapping the flag sets (their engine with our flags, ours with theirs, 4K, x3) puts our
+engine at 1,229 pp against their 649 - but see the caveat below, because that swap also revealed a lever for us.
+
+**A lever we have not explored: `--prefill` chunk size.**  Our engine with *their* flags looked faster than with
+our own (1,229 vs 922), so it was swept at 4K, 4 interleaved reps:
+
+| arm | pp median | range |
+| --- | ---: | --- |
+| our config (`--prefill 2048 --pcie-frac 0.30 --adapt-every 2`) | 921.3 | 860-925 |
+| `--prefill 8192 --pcie-frac 0.30 --adapt-every 2` | 1175.8 | 847-1244 |
+| `--prefill 8192 --pcie-frac 0 --adapt-every 0` | 1241.2 | 814-1336 |
+
+That is +28 % to +35 % on the median - but the `--prefill 8192` arms have a wide, apparently bimodal spread
+(847-1244, 814-1336) while our current config is tight (860-925).  So this is a **lead, not a conclusion**: worth
+one clean sweep with tracing, because a single-chunk prefill (8192 >= the 4,096-token prompt) evidently has a
+fast mode our two-chunk configuration does not reach.
+
+**Measurement cost, for future rounds.**  One run costs ~30 s of which ~23 s is process startup (measured: 30.19 s
+total, 4.85 s prefill, 2.53 s decode).  A 12-run interleaved sweep is therefore ~6 minutes of which ~4.5 is model
+loading.  Upstream's own docs avoid this by driving a persistent `--serve` engine.  With one GPU and per-arm flags,
+each arm switch costs a load, so the interleaved design inherently pays arms x reps loads; a server reduces the
+per-request cost from ~30 s to ~7 s (~2.4x on the same design) and only between-arm restarts remain.
