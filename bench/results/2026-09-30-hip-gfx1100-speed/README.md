@@ -688,3 +688,27 @@ Recommended configuration is therefore
 `--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --adapt-every 2 --mtp <rt>`, at
 **49.2-50.2 tok/s decode** against the CUDA counterpart's 50.5 (97-99 % of it), with pp unchanged
 (334 tok/s at 1K).
+
+## Round 17: the full tier matrix against the CUDA counterpart
+
+Same model (IQ3_S), same recommended HIP configuration
+(`--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --adapt-every 2 --mtp <rt>`, `--kv int8`
+above 4K), real C++ prompts via `bench/tools/tok_ascii.py`:
+
+| tier | HIP pp | CUDA pp | ratio | HIP tg | CUDA tg | ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 340-420 | 419 | 0.8-1.0 | **49.2-50.2** | 50.5 | **0.97-0.99** |
+| 4K | 495 | 893 | 0.55 | - | 44.6 | - |
+| 32K | 521-572 | 1,499 | 0.35-0.38 | **40.5** | 49.0 | **0.83** |
+
+**tg is 83-99 % of the counterpart across the range; pp falls off with prompt length, and the cause is
+measured rather than assumed.**  At 32K the engine streamed **258,880 expert blobs = 516 GB** in 16 chunks
+(the same experts re-streamed once per chunk, since 9,260 resident slots cannot hold a 24,576-expert
+working set), which is **36.3 s of the 62.9 s prefill = 58 %** on the 14.2 GB/s link.  The CUDA counterpart
+spends the *same share* of its time (32767/1499 = 21.9 s total, 516 GB at ~40 GB/s = 12.9 s = 59 %) - it is
+2.9x faster at 32K because its link is ~2.8x faster.  So the long-prompt pp gap is PCIe bandwidth over
+*re-streamed expert bytes*, not a port defect; the software lever would be residency/streaming strategy
+(prompt-aware caching), and the hardware lever is the x8 slot.
+
+Also worth recording at 32K: MTP drafting costs 4.61 ms/round (925 MiB of VRAM), admission acceptance stays
+high (0.860, 3.79 tokens/round), and `--adapt-every 2` costs only 0.154 ms/round of host swapping.
