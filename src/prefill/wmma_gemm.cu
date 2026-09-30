@@ -1,12 +1,13 @@
-// src/prefill/wmma_gemm.cu - RDNA3 WMMA FP16 GEMM for Strata prefill (gfx1100).
+// src/prefill/wmma_gemm.cu - RDNA3 WMMA FP16 & BF16 GEMM for Strata prefill (gfx1100).
 //
 // Computes Y[t, n] = beta * Y[t, n] + sum_k W[n, k] * X[t, k] using RDNA3 WMMA intrinsics:
-//   * X is T x K row-major (leading dim K), fp16
-//   * W is N x K row-major (leading dim K), fp16
+//   * X is T x K row-major (leading dim K), fp16 or bf16
+//   * W is N x K row-major (leading dim K), fp16 or bf16
 //   * Y is T x N row-major with leading dimension ldy >= N, fp32
 //
 // Hardware: AMD RDNA3 (gfx1100, e.g. RX 7900 XTX)
 //   * v_wmma_f32_16x16x16_f16_w32 intrinsic (__builtin_amdgcn_wmma_f32_16x16x16_f16_w32)
+//   * v_wmma_f32_16x16x16_bf16_w32 intrinsic (__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32)
 //   * Wave32 doubled input fragment: lane t (lane_lo = t & 15) holds row lane_lo of A (16 elements along K)
 //     and column lane_lo of B (16 elements along K). Lanes 16..31 duplicate lanes 0..15.
 //   * Wave32 C output mapping: lane t holds column lane_lo of 16x16 output tile,
@@ -19,6 +20,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 
 // STRATA_WMMA_GFX11 is defined by the BUILD (CMakeLists.txt, from CMAKE_HIP_ARCHITECTURES), not inferred
 // from compiler macros: measured on this toolchain the HOST pass of a HIP compile does not define
@@ -28,19 +30,39 @@
 // build-defined macro is uniform across the host and device passes.
 #if defined(STRATA_WMMA_GFX11)
 
-using v16fp16 = _Float16 __attribute__((ext_vector_type(16)));
 using v8fp32 = float __attribute__((ext_vector_type(8)));
+
+template <typename ElemT>
+struct WmmaTraits;
+
+template <>
+struct WmmaTraits<_Float16> {
+    using vec_t = _Float16 __attribute__((ext_vector_type(16)));
+    __device__ static inline v8fp32 mma(vec_t a, vec_t b, v8fp32 c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+    }
+};
+
+template <>
+struct WmmaTraits<__bf16> {
+    using vec_t = __bf16 __attribute__((ext_vector_type(16)));
+    __device__ static inline v8fp32 mma(vec_t a, vec_t b, v8fp32 c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+    }
+};
 
 // ===========================================================================
 // Variant 1: 16x16_1w - Single-wave kernel for small T / N.
 // Zero LDS, zero barrier synchronization, full register residency.
 // ===========================================================================
+template <typename ElemT>
 __global__ void gemm_wmma_16x16_1w(
     const uint16_t* __restrict__ X,
     const uint16_t* __restrict__ W,
     float* __restrict__ Y,
     int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
 
+    using vec_t = typename WmmaTraits<ElemT>::vec_t;
     const int m_tile = blockIdx.y * 16;
     const int n_tile = blockIdx.x * 16;
     if (m_tile >= T || n_tile >= N) return;
@@ -55,7 +77,7 @@ __global__ void gemm_wmma_16x16_1w(
     const int n_row = n_tile + lane_lo;
 
     for (int k_tile = 0; k_tile < K; k_tile += 16) {
-        v16fp16 a_frag, b_frag;
+        vec_t a_frag, b_frag;
 
         if (m_row < T) {
             __builtin_memcpy(&a_frag, X + (int64_t)m_row * K + k_tile, sizeof(a_frag));
@@ -71,7 +93,7 @@ __global__ void gemm_wmma_16x16_1w(
             for (int i = 0; i < 16; ++i) b_frag[i] = 0;
         }
 
-        c_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_acc);
+        c_acc = WmmaTraits<ElemT>::mma(a_frag, b_frag, c_acc);
     }
 
     const int out_n = n_tile + lane_lo;
@@ -95,12 +117,14 @@ __global__ void gemm_wmma_16x16_1w(
 // Variant 2: 64x64_4w - 4 waves per block (128 threads), 64T x 64N tile.
 // Double-buffered LDS tile for W (4 KB LDS total), cooperative 128-bit global loads.
 // ===========================================================================
+template <typename ElemT>
 __global__ void gemm_wmma_64x64_4w(
     const uint16_t* __restrict__ X,
     const uint16_t* __restrict__ W,
     float* __restrict__ Y,
     int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
 
+    using vec_t = typename WmmaTraits<ElemT>::vec_t;
     const int m_tile = blockIdx.y * 64;
     const int n_tile = blockIdx.x * 64;
     if (m_tile >= T || n_tile >= N) return;
@@ -118,7 +142,7 @@ __global__ void gemm_wmma_64x64_4w(
     v8fp32 c_acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
 
     // Double-buffered LDS tile: 64 rows of N x 16 elements of K (2 KB per buffer)
-    __shared__ _Float16 b_lds[2][64][16];
+    alignas(16) __shared__ ElemT b_lds[2][64][16];
 
     // Thread mapping for cooperative loading of W into LDS (128 threads load 64x16 elements)
     // Each thread loads 8 halfs (16 bytes = uint4)
@@ -153,7 +177,7 @@ __global__ void gemm_wmma_64x64_4w(
         }
 
         // Load A fragment from X for current wave's 16 M-rows
-        v16fp16 a_frag;
+        vec_t a_frag;
         if (m_row < T) {
             __builtin_memcpy(&a_frag, X + (int64_t)m_row * K + k_tile, sizeof(a_frag));
         } else {
@@ -162,16 +186,16 @@ __global__ void gemm_wmma_64x64_4w(
         }
 
         // Read B fragments from LDS and compute WMMA
-        v16fp16 b_frag0, b_frag1, b_frag2, b_frag3;
-        __builtin_memcpy(&b_frag0, &b_lds[cur_buf][0 + lane_lo][0], sizeof(v16fp16));
-        __builtin_memcpy(&b_frag1, &b_lds[cur_buf][16 + lane_lo][0], sizeof(v16fp16));
-        __builtin_memcpy(&b_frag2, &b_lds[cur_buf][32 + lane_lo][0], sizeof(v16fp16));
-        __builtin_memcpy(&b_frag3, &b_lds[cur_buf][48 + lane_lo][0], sizeof(v16fp16));
+        vec_t b_frag0, b_frag1, b_frag2, b_frag3;
+        __builtin_memcpy(&b_frag0, &b_lds[cur_buf][0 + lane_lo][0], sizeof(vec_t));
+        __builtin_memcpy(&b_frag1, &b_lds[cur_buf][16 + lane_lo][0], sizeof(vec_t));
+        __builtin_memcpy(&b_frag2, &b_lds[cur_buf][32 + lane_lo][0], sizeof(vec_t));
+        __builtin_memcpy(&b_frag3, &b_lds[cur_buf][48 + lane_lo][0], sizeof(vec_t));
 
-        c_acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag0, c_acc0);
-        c_acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag1, c_acc1);
-        c_acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag2, c_acc2);
-        c_acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag3, c_acc3);
+        c_acc0 = WmmaTraits<ElemT>::mma(a_frag, b_frag0, c_acc0);
+        c_acc1 = WmmaTraits<ElemT>::mma(a_frag, b_frag1, c_acc1);
+        c_acc2 = WmmaTraits<ElemT>::mma(a_frag, b_frag2, c_acc2);
+        c_acc3 = WmmaTraits<ElemT>::mma(a_frag, b_frag3, c_acc3);
 
         __syncthreads();
         cur_buf = next_buf;
@@ -203,9 +227,10 @@ __global__ void gemm_wmma_64x64_4w(
     store_acc(c_acc3, n_tile + 48);
 }
 
-bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
-                          int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
-                          void* stream) {
+template <typename ElemT>
+static inline bool strata_wmma_gemm_dispatch(const uint16_t* X, const uint16_t* W, float* Y,
+                                             int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                                             void* stream) {
     if (!X || !W || !Y) return false;
     if (T <= 0 || N <= 0 || K <= 0) return false;
     if (K % 16 != 0) return false;
@@ -218,20 +243,38 @@ bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
     if (T >= 32 && N >= 32) {
         dim3 block(128);
         dim3 grid((uint32_t)((N + 63) / 64), (uint32_t)((T + 63) / 64), 1);
-        gemm_wmma_64x64_4w<<<grid, block, 0, s>>>(X, W, Y, T, N, K, ldy, beta);
+        gemm_wmma_64x64_4w<ElemT><<<grid, block, 0, s>>>(X, W, Y, T, N, K, ldy, beta);
     } else {
         dim3 block(32);
         dim3 grid((uint32_t)((N + 15) / 16), (uint32_t)((T + 15) / 16), 1);
-        gemm_wmma_16x16_1w<<<grid, block, 0, s>>>(X, W, Y, T, N, K, ldy, beta);
+        gemm_wmma_16x16_1w<ElemT><<<grid, block, 0, s>>>(X, W, Y, T, N, K, ldy, beta);
     }
     return true;
 }
 
+bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
+                          int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                          void* stream) {
+    return strata_wmma_gemm_dispatch<_Float16>(X, W, Y, T, N, K, ldy, beta, stream);
+}
+
+bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
+                           int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                           void* stream) {
+    return strata_wmma_gemm_dispatch<__bf16>(X, W, Y, T, N, K, ldy, beta, stream);
+}
+
 #else
-// Non-HIP compilation fallback
+// Non-HIP / Non-GFX11 compilation fallback
 bool strata_wmma_gemm_f16(const uint16_t*, const uint16_t*, float*,
                           int64_t, int64_t, int64_t, int64_t, float,
                           void*) {
+    return false;
+}
+
+bool strata_wmma_gemm_bf16(const uint16_t*, const uint16_t*, float*,
+                           int64_t, int64_t, int64_t, int64_t, float,
+                           void*) {
     return false;
 }
 #endif

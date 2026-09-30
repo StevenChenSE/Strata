@@ -1,11 +1,13 @@
-// .rocm-eval/probe/wmma_gemm_test.cu - Self-test probe for RDNA3 WMMA FP16 GEMM vs rocBLAS
+// .rocm-eval/probe/wmma_gemm_test.cu - Self-test probe for RDNA3 WMMA FP16 & BF16 GEMM vs rocBLAS
 #include "src/prefill/wmma_gemm.h"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 #include <rocblas/rocblas.h>
 
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <vector>
 #include <random>
@@ -18,42 +20,23 @@ struct ShapeTest {
     const char* label;
 };
 
-int main() {
-    printf("===============================================================================================================\n");
-    printf(" RDNA3 WMMA FP16 GEMM vs rocBLAS self-test probe (AMD gfx1100 / ROCm)\n");
-    printf("===============================================================================================================\n");
+enum class GemmDType { FP16, BF16 };
 
-    rocblas_handle handle;
-    rocblas_status rst = rocblas_create_handle(&handle);
-    if (rst != rocblas_status_success) {
-        std::fprintf(stderr, "Failed to create rocblas handle: %d\n", (int)rst);
-        return 1;
-    }
-
-    ShapeTest shapes[] = {
-        // Engine shapes
-        {12288, 1023, 2560,  0.0f, "12288x1023x2560 (q_proj-like)"},
-        {1023,  2560, 12288, 0.0f, "1023x2560x12288 (o_proj-like)"},
-        {2560,  1023, 12288, 0.0f, "2560x1023x12288 (down_proj-like)"},
-        {5120,  1023, 2560,  0.0f, "5120x1023x2560  (ssm/gate-like)"},
-        {4096,  4096, 4096,  0.0f, "4096x4096x4096  (square 4K)"},
-        // Awkward shapes
-        {1023,  257,  2560,  0.0f, "1023x257x2560   (awkward T=257)"},
-        {1023,  33,   2560,  0.0f, "1023x33x2560    (awkward T=33)"},
-        {1023,  7,    2560,  0.0f, "1023x7x2560     (awkward T=7)"},
-        {1023,  1,    2560,  0.0f, "1023x1x2560     (awkward T=1)"},
-        // Beta == 1 test
-        {4096,  1023, 2560,  1.0f, "4096x1023x2560  (beta=1.0 accumulation)"},
-    };
+void run_test_suite(rocblas_handle handle, const ShapeTest* shapes, size_t num_shapes, GemmDType dtype) {
+    const bool is_bf16 = (dtype == GemmDType::BF16);
+    printf("\n=======================================================================================================================\n");
+    printf(" RDNA3 WMMA %s GEMM vs rocBLAS self-test probe (AMD gfx1100 / ROCm)\n", is_bf16 ? "BF16" : "FP16");
+    printf("=======================================================================================================================\n");
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
-    printf("%-35s | %8s %8s | %8s %8s | %10s %10s\n",
-           "Shape", "WMMA ms", "WMMA TF", "rocB ms", "rocB TF", "MaxAbsErr", "MaxRelErr");
-    printf("---------------------------------------------------------------------------------------------------------------\n");
+    printf("%-35s | %8s %8s | %8s %8s | %10s %10s | %6s\n",
+           "Shape", "WMMA ms", "WMMA TF", "rocB ms", "rocB TF", "MaxAbsErr", "MaxRelErr", "NaNs");
+    printf("-----------------------------------------------------------------------------------------------------------------------\n");
 
-    for (const auto& s : shapes) {
+    for (size_t s_idx = 0; s_idx < num_shapes; ++s_idx) {
+        const auto& s = shapes[s_idx];
         const int64_t N = s.n;
         const int64_t T = s.t;
         const int64_t K = s.k;
@@ -68,8 +51,13 @@ int main() {
         std::vector<uint16_t> h_W(N * K);
         std::vector<float> h_Y_init(T * ldy, 0.0f);
 
-        for (size_t i = 0; i < h_X.size(); ++i) h_X[i] = (uint16_t)__float2half_rn(dist(rng));
-        for (size_t i = 0; i < h_W.size(); ++i) h_W[i] = (uint16_t)__float2half_rn(dist(rng));
+        if (!is_bf16) {
+            for (size_t i = 0; i < h_X.size(); ++i) { __half hv = __float2half_rn(dist(rng)); std::memcpy(&h_X[i], &hv, 2); }
+            for (size_t i = 0; i < h_W.size(); ++i) { __half hv = __float2half_rn(dist(rng)); std::memcpy(&h_W[i], &hv, 2); }
+        } else {
+            for (size_t i = 0; i < h_X.size(); ++i) h_X[i] = hip_bfloat16(dist(rng)).data;
+            for (size_t i = 0; i < h_W.size(); ++i) h_W[i] = hip_bfloat16(dist(rng)).data;
+        }
         if (beta != 0.0f) {
             for (size_t i = 0; i < h_Y_init.size(); ++i) h_Y_init[i] = dist(rng);
         }
@@ -90,20 +78,23 @@ int main() {
         const float alpha = 1.0f;
 
         // Run both once for correctness check
-        bool wmma_ok = strata_wmma_gemm_f16(d_X, d_W, d_Y_wmma, T, N, K, ldy, beta);
+        bool wmma_ok = !is_bf16
+            ? strata_wmma_gemm_f16(d_X, d_W, d_Y_wmma, T, N, K, ldy, beta)
+            : strata_wmma_gemm_bf16(d_X, d_W, d_Y_wmma, T, N, K, ldy, beta);
         if (!wmma_ok) {
-            printf("%-35s | strata_wmma_gemm_f16 returned false (fallback)\n", s.label);
+            printf("%-35s | strata_wmma_gemm_%s returned false (fallback)\n", s.label, is_bf16 ? "bf16" : "f16");
             (void)hipFree(d_X); (void)hipFree(d_W); (void)hipFree(d_Y_wmma); (void)hipFree(d_Y_rocb);
             continue;
         }
 
-        rst = rocblas_gemm_ex(handle, rocblas_operation_transpose, rocblas_operation_none,
-                              (rocblas_int) N, (rocblas_int) T, (rocblas_int) K,
-                              &alpha, d_W, rocblas_datatype_f16_r, (rocblas_int) K,
-                              d_X, rocblas_datatype_f16_r, (rocblas_int) K,
-                              &beta, d_Y_rocb, rocblas_datatype_f32_r, (rocblas_int) ldy,
-                              d_Y_rocb, rocblas_datatype_f32_r, (rocblas_int) ldy,
-                              rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+        rocblas_datatype in_type = !is_bf16 ? rocblas_datatype_f16_r : rocblas_datatype_bf16_r;
+        rocblas_status rst = rocblas_gemm_ex(handle, rocblas_operation_transpose, rocblas_operation_none,
+                                              (rocblas_int) N, (rocblas_int) T, (rocblas_int) K,
+                                              &alpha, d_W, in_type, (rocblas_int) K,
+                                              d_X, in_type, (rocblas_int) K,
+                                              &beta, d_Y_rocb, rocblas_datatype_f32_r, (rocblas_int) ldy,
+                                              d_Y_rocb, rocblas_datatype_f32_r, (rocblas_int) ldy,
+                                              rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
         if (rst != rocblas_status_success) {
             printf("%-35s | rocblas_gemm_ex returned status %d\n", s.label, (int)rst);
             (void)hipFree(d_X); (void)hipFree(d_W); (void)hipFree(d_Y_wmma); (void)hipFree(d_Y_rocb);
@@ -112,17 +103,22 @@ int main() {
 
         (void)hipDeviceSynchronize();
 
-        // Compare results
+        // Compare results with explicit NaN checking
         std::vector<float> h_Y_wmma(T * ldy), h_Y_rocb(T * ldy);
         (void)hipMemcpy(h_Y_wmma.data(), d_Y_wmma, y_bytes, hipMemcpyDeviceToHost);
         (void)hipMemcpy(h_Y_rocb.data(), d_Y_rocb, y_bytes, hipMemcpyDeviceToHost);
 
+        int64_t nan_count = 0;
         float max_abs_err = 0.0f;
         float max_rel_err = 0.0f;
         for (int64_t t = 0; t < T; ++t) {
             for (int64_t n = 0; n < N; ++n) {
                 float vw = h_Y_wmma[t * ldy + n];
                 float vr = h_Y_rocb[n + t * ldy]; // rocblas is col-major
+                if (std::isnan(vw) || std::isnan(vr)) {
+                    nan_count++;
+                    continue;
+                }
                 float diff = std::abs(vw - vr);
                 float rel = diff / (std::abs(vr) + 1e-6f);
                 if (diff > max_abs_err) max_abs_err = diff;
@@ -139,7 +135,11 @@ int main() {
         // 1. WMMA timing
         (void)hipEventRecord(start);
         for (int i = 0; i < reps; ++i) {
-            strata_wmma_gemm_f16(d_X, d_W, d_Y_wmma, T, N, K, ldy, beta);
+            if (!is_bf16) {
+                strata_wmma_gemm_f16(d_X, d_W, d_Y_wmma, T, N, K, ldy, beta);
+            } else {
+                strata_wmma_gemm_bf16(d_X, d_W, d_Y_wmma, T, N, K, ldy, beta);
+            }
         }
         (void)hipEventRecord(stop);
         (void)hipEventSynchronize(stop);
@@ -153,8 +153,8 @@ int main() {
         for (int i = 0; i < reps; ++i) {
             rocblas_gemm_ex(handle, rocblas_operation_transpose, rocblas_operation_none,
                             (rocblas_int) N, (rocblas_int) T, (rocblas_int) K,
-                            &alpha, d_W, rocblas_datatype_f16_r, (rocblas_int) K,
-                            d_X, rocblas_datatype_f16_r, (rocblas_int) K,
+                            &alpha, d_W, in_type, (rocblas_int) K,
+                            d_X, in_type, (rocblas_int) K,
                             &beta, d_Y_rocb, rocblas_datatype_f32_r, (rocblas_int) ldy,
                             d_Y_rocb, rocblas_datatype_f32_r, (rocblas_int) ldy,
                             rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
@@ -166,8 +166,8 @@ int main() {
         ms_rocb /= reps;
         double tflops_rocb = (2.0 * N * T * K) / (ms_rocb * 1e-3) / 1e12;
 
-        printf("%-35s | %8.3f %8.1f | %8.3f %8.1f | %10.2e %10.2e\n",
-               s.label, ms_wmma, tflops_wmma, ms_rocb, tflops_rocb, max_abs_err, max_rel_err);
+        printf("%-35s | %8.3f %8.1f | %8.3f %8.1f | %10.2e %10.2e | %6ld\n",
+               s.label, ms_wmma, tflops_wmma, ms_rocb, tflops_rocb, max_abs_err, max_rel_err, (long)nan_count);
 
         (void)hipEventDestroy(start);
         (void)hipEventDestroy(stop);
@@ -177,7 +177,40 @@ int main() {
         (void)hipFree(d_Y_rocb);
     }
 
-    printf("===============================================================================================================\n");
+    printf("=======================================================================================================================\n");
+}
+
+int main() {
+    rocblas_handle handle;
+    rocblas_status rst = rocblas_create_handle(&handle);
+    if (rst != rocblas_status_success) {
+        std::fprintf(stderr, "Failed to create rocblas handle: %d\n", (int)rst);
+        return 1;
+    }
+
+    const ShapeTest shapes[] = {
+        // Engine shapes
+        {12288, 1023, 2560,  0.0f, "12288x1023x2560 (q_proj-like)"},
+        {1023,  2560, 12288, 0.0f, "1023x2560x12288 (o_proj-like)"},
+        {2560,  1023, 12288, 0.0f, "2560x1023x12288 (down_proj-like)"},
+        {5120,  1023, 2560,  0.0f, "5120x1023x2560  (ssm/gate-like)"},
+        {4096,  4096, 4096,  0.0f, "4096x4096x4096  (square 4K)"},
+        // Awkward shapes
+        {1023,  257,  2560,  0.0f, "1023x257x2560   (awkward T=257)"},
+        {1023,  33,   2560,  0.0f, "1023x33x2560    (awkward T=33)"},
+        {1023,  7,    2560,  0.0f, "1023x7x2560     (awkward T=7)"},
+        {1023,  1,    2560,  0.0f, "1023x1x2560     (awkward T=1)"},
+        // Beta == 1 test
+        {4096,  1023, 2560,  1.0f, "4096x1023x2560  (beta=1.0 accumulation)"},
+    };
+    const size_t num_shapes = sizeof(shapes) / sizeof(shapes[0]);
+
+    // 1. FP16 Test Suite
+    run_test_suite(handle, shapes, num_shapes, GemmDType::FP16);
+
+    // 2. BF16 Test Suite
+    run_test_suite(handle, shapes, num_shapes, GemmDType::BF16);
+
     rocblas_destroy_handle(handle);
     return 0;
 }

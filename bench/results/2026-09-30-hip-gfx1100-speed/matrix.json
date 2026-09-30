@@ -354,5 +354,33 @@
     "prefill_ms": 7069.2,
     "prefill_tok_s": 579.27,
     "note": "no-WMMA 7621.1 ms (537.3 tok/s) -> -7.2%"
+  },
+  {
+    "model": "IQ3_S",
+    "max_new": 1,
+    "exit": 0,
+    "spec": "2",
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "1k-wmma-f16+bf16",
+    "prompt_tokens": 1023,
+    "prefill_ms": 2501.8,
+    "prefill_tok_s": 408.9,
+    "note": "both WMMA paths; second pair 2661.2 ms (384.4); all-rocBLAS 3116/3127 ms -> -18%"
+  },
+  {
+    "model": "IQ3_S",
+    "max_new": 1,
+    "exit": 0,
+    "spec": "2",
+    "cache": "auto",
+    "prefill_chunk": 2048,
+    "prompt": "real C++ via bench/tools/tok_ascii.py",
+    "run": "4k-wmma-f16+bf16",
+    "prompt_tokens": 4095,
+    "prefill_ms": 6912.6,
+    "prefill_tok_s": 592.4,
+    "note": "both WMMA paths; second pair 7117.9 ms (575.3); all-rocBLAS 8040 ms -> -11 to -14%"
   }
 ]

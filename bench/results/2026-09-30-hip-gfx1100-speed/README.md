@@ -970,3 +970,41 @@ the same configuration.  That variance is the rocBLAS bf16 path behaving like th
 1K A/B showed the rocBLAS arm swinging 3,029-4,312 ms while the WMMA arm held within 0.7 %), so the delegated
 BF16 WMMA variant should both speed this phase up and stabilise it - and stabilising it may matter as much as
 its average cost, since it is what moves whole-run prompt throughput between 7.6 s and 9.2 s.
+
+## Round 23: BF16 WMMA lands - 1K pp reaches 385-409 tok/s (92-98 % of the CUDA counterpart)
+
+`workflow-16` (the tight re-delegation after killing a stalled one) added a BF16 variant by templating the
+existing kernels on the element type (`WmmaTraits<_Float16>` / `WmmaTraits<__bf16>`, the latter calling
+`v_wmma_f32_16x16x16_bf16_w32` with the same fragment layout) and dispatching it from `Gemm::bf16` behind the
+same env gate.  Its own stub check was the one I demanded:
+
+    strata_wmma_gemm_f16 : 0x19d (413 bytes)
+    strata_wmma_gemm_bf16: 0x19d (413 bytes)     <- not the 3-byte stub
+    nm -C build-hip/strata-hip | grep -c gemm_wmma -> 8
+
+**Verified independently before trusting it.** The probe's new NaN counter (which I required) immediately
+reported 5.8M NaNs on the *fp16* suite - with 0.00e+00 error, the same NaN-blind artifact as before.  That
+turned out to be the probe's own input generation: `(uint16_t)__float2half_rn(x)` converts `__half` to float
+and truncates instead of taking its bits, so both sides computed on near-zero data.  Fixed in the tracked
+probe.  `bench/tools/wmma_gemm_varied_check.cu` then checked both entry points against a host **fp64**
+reference with varied exactly-representable inputs: `maxdev = 0.000e+00`, 0 wrong, 0 NaN on every shape,
+including the engine's 12288x1023x2560 (12.6M outputs) for **both** fp16 and bf16.
+
+**Measured** (interleaved pairs; `STRATA_WMMA_BF16=0` isolates the bf16 increment, `STRATA_WMMA_GEMM=0` forces
+rocBLAS for both):
+
+| tier | both WMMA | all rocBLAS | gain |
+| --- | ---: | ---: | ---: |
+| 1K | **2,502 / 2,661 ms (408.9 / 384.4 tok/s)** | 3,116 / 3,127 ms (328 / 327) | **-18 %** |
+| 4K | **6,913 / 7,118 ms (592.4 / 575.3 tok/s)** | 8,040.5 / 8,039.6 ms (509.3) | **-11 to -14 %** |
+
+Two incidental findings:
+
+* **The mixed configuration is worse than either extreme**: fp16-on-WMMA with bf16-on-rocBLAS measured
+  4,603 / 3,203 ms at 1K - slower than all-rocBLAS (3,116 / 3,127) and far more erratic.  So it is worth
+  having both paths on WMMA, and the bf16 work was worth doing even though its own share is modest.
+* The 8-token seed run still reproduces the reference tokens exactly
+  (`271 7734 264 13280 9834 421 15339 279`) with the bf16 path live, so the accumulation-order change did not
+  flip a single argmax there.
+
+Current standing: pp@1K ~385-409 vs the counterpart's 419 (92-98 %), pp@4K 575-592 vs 893 (64-66 %).
