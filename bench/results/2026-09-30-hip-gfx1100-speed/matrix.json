@@ -72,5 +72,85 @@
       "commit_ms": 0.766
     },
     "prompt": "same, --spec-min-p 1.0"
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "vram_slots": 9906,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "run": "1k-real-code",
+    "prefill_tok_s": 313.39,
+    "decode_tok_s": 33.15,
+    "decode_ms": 7721.9,
+    "prefill_ms": 3264.3,
+    "spec_tokens_per_round": 1.28,
+    "spec_accept": 0.277,
+    "spec": "2",
+    "suffix_draft": 3,
+    "per_round": {
+      "wait_ms": 25.844,
+      "pool_ms": 9.977,
+      "commit_ms": 0.757
+    }
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "vram_slots": 9906,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "run": "1k-real-code-spec4",
+    "decode_tok_s": 26.98,
+    "decode_ms": 9487.0,
+    "spec_tokens_per_round": 1.45,
+    "spec_accept": 0.153,
+    "spec": "4"
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "vram_slots": 9906,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "run": "1k-real-code-spec6",
+    "decode_tok_s": 18.88,
+    "decode_ms": 13556.8,
+    "spec_tokens_per_round": 1.47,
+    "spec_accept": 0.107,
+    "spec": "6"
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "vram_slots": 9906,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "run": "1k-real-code-suffix4",
+    "decode_tok_s": 31.58,
+    "decode_ms": 8106.5,
+    "spec_tokens_per_round": 1.24,
+    "spec_accept": 0.223,
+    "spec": "2",
+    "suffix_draft": 4
+  },
+  {
+    "model": "IQ3_S",
+    "prompt_tokens": 1023,
+    "max_new": 256,
+    "exit": 0,
+    "vram_slots": 9906,
+    "prompt": "real C++ (src/core/expert_source.cpp) via bench/tools/tok_ascii.py",
+    "run": "1k-real-code-suffix24",
+    "decode_tok_s": 27.1,
+    "decode_ms": 9446.8,
+    "spec_tokens_per_round": 1.0,
+    "spec_accept": 0.0,
+    "spec": "2",
+    "suffix_draft": 24
   }
 ]

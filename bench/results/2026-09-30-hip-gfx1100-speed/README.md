@@ -267,3 +267,44 @@ arithmetic path, and the tokens diverge.  Evidence from the `adaptive tier N exp
 So "identical token sequence" is only a valid acceptance test between runs whose swap count agrees (and
 only then does it prove the change is numerically neutral, which it is here).  The short 8-token seed run
 remains bit-reproducible and is the cheap regression check.
+
+## Round 4: real-text throughput — the tg gap is DRAFTING, not kernels
+
+`tools/strata_tokenizer.py` cannot run here (it imports the third-party `regex`, and there is no pip),
+and neither of my constructed prompts measures realistic acceptance (80x repeat -> 100 %, pseudo-random
+ids -> 2 %).  So `bench/tools/tok_ascii.py` (mine, stdlib only) tokenizes ASCII text with the pack's own
+`vocab.json`/`merges.txt` and the pack's shipped Qwen3.5 pre-tokenizer pattern, with
+`decode(encode(text)) == text` as a self-check (3.36 chars/token, round-trip exact, coherent tokens).
+
+**1,024 tokens of real C++ (`src/core/expert_source.cpp`), 256 generated, cache 8192:**
+
+| | tokens/round | ms/round | decode |
+| --- | ---: | ---: | ---: |
+| **HIP (this box, real code text)** | **1.28** | **38.6** | **33.15 tok/s** |
+| CUDA counterpart (`--spec 4 --spec-min-p 0.5`, MTP weights, real code-agent prompts) | 2.77 | ~54.9 | 50.5 tok/s |
+| HIP, constructed repeat prompt | 3.95 | 98.4 | 40.0 tok/s |
+| HIP, pseudo-random ids | 1.02 | 39.1 | 26.0 tok/s |
+
+The CUDA row's round time is *inferred* from its published tokens/round.  On that basis **HIP is already
+1.42x faster per round (38.6 vs 54.9 ms) and is behind only on tokens/round (1.28 vs 2.77)** - and the
+CUDA figure is with MTP, which this port has never had (the ~5 GB MTP weights were not fetched).  So the
+remaining tg gap is a drafting/weights gap, not a kernel gap.
+
+Knob sweeps on the same real-text prompt confirm the defaults are already the optimum:
+
+| knob | tokens/round | decode |
+| --- | ---: | ---: |
+| `--spec 2` (window 4) | 1.28 | **33.15 tok/s** |
+| `--spec 4` (window 6) | 1.45 | 26.98 tok/s |
+| `--spec 6` (window 8) | 1.47 | 18.88 tok/s |
+| `--suffix-draft 3` (default) | 1.28 | **33.15 tok/s** |
+| `--suffix-draft 4` | 1.24 | 31.58 tok/s |
+| `--suffix-draft 24` | 1.00 | 27.10 tok/s |
+
+Deeper windows buy a little acceptance (drafts accepted 56/202 at spec 2 vs 80/524 at spec 4 - the hit
+rate *falls*) and cost more verification work per round, so they lose.  The prompt-lookup suffix drafter
+is the accurate one (56 of 80 accepted at the default) but only fires on ~25 % of windows, and requiring
+a longer match only reduces its coverage.
+
+**Recommendation:** the only large tg lever left is the MTP draft weights (`--mtp`, a ~5 GB fetch);
+everything reachable without them is measured at or near its optimum.
