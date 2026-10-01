@@ -712,3 +712,26 @@ nothing.
 Verification: new default 6/6 clean via CLI; negative control STRATA_MMQ_GATHER=batch still loops 2/3 (the bug
 remains reachable exactly through that path); the redeployed service ran the reproducing API request 6/6 clean
 (was 50-80 %) with coherent reasoning in every response.
+
+### Adopted upstream PR #322 (fast packed-byte intrinsics, v_perm_b32 + SWAR) - verified then tuned
+
+Cherry-picked bsorensen110's fast-intrinsics commits (7da45db + 01e428a) onto hip-gfx1100, over our existing
+strata_hip_nanosleep port (clean cherry-pick; the packed-byte region and the nanosleep addition don't overlap).
+
+Correctness: exhaustive parity test passes on gfx1100 (262144 cases, 1048576 results, all 65536 byte pairs x 4096
+selectors, 16 guards); our WMMA parity still 22/22. The intrinsics are header-inline and used by iq_kernels.cu /
+native_mmvq.cu - compiled into our decode (v_perm_b32 confirmed in the objects).
+
+The decode A/B turned out to be a two-factor story:
+
+1. The intrinsics' benefit depends on being GPU-dequant-bound. At --adapt-every 0 our branch is CPU-pool-bound
+   (verify window: wait-for-rings 30.4 + pool 44.7 ms/r vs upstream 18.8 + 24.8) and the patch gains only ~2%
+   (four-way, adapt-0, interleaved: br 42.2 vs brp 42.9; upstream 47.8 vs 51.0).
+2. Residency is the real lever: --adapt-every 2 keeps the decode's hot experts resident, moving the work back to
+   the GPU where the intrinsics help. Four-way at adapt-2 (interleaved, 1K, 512 tokens): our branch 53.1 -> 65.8
+   tok/s with the patch (+24%), against upstream 69.0 / 71.3. And the adapt-0 vs adapt-2 gap on our branch alone
+   was huge: 45.4 vs 65.7 tok/s (+45%, three interleaved reps, non-overlapping).
+
+At the SERVICE's actual configuration (spec 2, adapt-every 2, pcie-frac 0.30, int8 KV, 32K prompt, 256 new), a
+head-to-head with upstream+patch: our branch pp 737 / tg 54.7 against upstream pp 651 / tg 36.8 - ahead on both,
+which is where the service now sits (intrinsics adopted, adapt-every already 2, spec 2).
