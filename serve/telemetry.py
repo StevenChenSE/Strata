@@ -159,6 +159,21 @@ class _Amd:
         except (OSError, ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _speed_to_gen(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                s = f.read().strip()
+            tok = s.split()[0] if s else ""
+            if tok.endswith("GT/s"):
+                tok = tok[:-4]
+            v = float(tok)
+            if 0 < v <= 2.5:
+                return 1
+            return {5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}.get(v)
+        except (OSError, ValueError, IndexError, TypeError):
+            return None
+
     def name(self):
         try:
             with open(os.path.join(self.dev, "product_name"), encoding="utf-8") as f:
@@ -170,6 +185,12 @@ class _Amd:
         out = {"util": self._int(os.path.join(self.dev, "gpu_busy_percent")),
                "mem_used": self._int(os.path.join(self.dev, "mem_info_vram_used")),
                "mem_total": self._int(os.path.join(self.dev, "mem_info_vram_total"))}
+        if self.dev:
+            out["pcie_gen"] = self._speed_to_gen(os.path.join(self.dev, "current_link_speed"))
+            out["pcie_gen_max"] = self._speed_to_gen(os.path.join(self.dev, "max_link_speed"))
+            out["pcie_width"] = self._int(os.path.join(self.dev, "current_link_width"))
+        else:
+            out["pcie_gen"] = out["pcie_gen_max"] = out["pcie_width"] = None
         if self.hwmon:
             t = self._int(os.path.join(self.hwmon, "temp1_input"))
             out["temp"] = t / 1000.0 if t is not None else None

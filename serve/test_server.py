@@ -1718,6 +1718,9 @@ class AmdTelemetry(unittest.TestCase):
             (dev / "mem_info_vram_used").write_text(f"{used}\n")
             (dev / "mem_info_vram_total").write_text(f"{32 << 30}\n")
             (dev / "product_name").write_text("AMD Radeon AI PRO R9700\n")
+            (dev / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+            (dev / "max_link_speed").write_text("16.0 GT/s PCIe\n")
+            (dev / "current_link_width").write_text("16\n")
             (hw / "temp1_input").write_text(f"{temp}\n")
             if power is not None:
                 (hw / "power1_average").write_text(f"{power}\n")
@@ -1737,9 +1740,16 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertTrue(g.ok())
                 self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
-                                            "power": 85.0, "power_limit": 300.0})
+                                            "power": 85.0, "power_limit": 300.0,
+                                            "pcie_gen": 4, "pcie_gen_max": 4, "pcie_width": 16})
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
+                self.assertEqual((r["pcie_gen"], r["pcie_gen_max"], r["pcie_width"]), (4, 4, 16))
+                for f in ("current_link_speed", "max_link_speed", "current_link_width"):
+                    (Path(d) / "class/drm/renderD129/device" / f).unlink()
+                r_nolink = g.read()
+                self.assertEqual((r_nolink["pcie_gen"], r_nolink["pcie_gen_max"], r_nolink["pcie_width"]),
+                                 (None, None, None))
                 self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
                 self.assertIsNone(telemetry.free_vram_mib(5, amd=True))
                 t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)
@@ -1761,6 +1771,18 @@ class AmdTelemetry(unittest.TestCase):
             self.tree(d)
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
+    def test_amd_pcie_speed_to_gen(self):
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "speed"
+            for raw, expected in (("16.0 GT/s PCIe\n", 4), ("16.0 GT/s\n", 4), ("16\n", 4),
+                                  ("2.5 GT/s PCIe\n", 1), ("2.5\n", 1), ("5.0 GT/s\n", 2),
+                                  ("8.0 GT/s PCIe\n", 3), ("32.0 GT/s PCIe\n", 5),
+                                  ("64.0 GT/s PCIe\n", 6), ("unknown\n", None), ("", None)):
+                p.write_text(raw)
+                self.assertEqual(telemetry._Amd._speed_to_gen(str(p)), expected)
+            self.assertIsNone(telemetry._Amd._speed_to_gen(str(Path(d) / "missing")))
 
 
 if __name__ == "__main__":
