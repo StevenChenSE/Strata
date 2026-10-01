@@ -5781,6 +5781,8 @@ int main(int argc, char** argv) {
             for (int64_t t : produced) sfx.append((int32_t) t);
         }
         const double pool_ms0 = drive.cpu_ms;
+        double ph_wp0 = 0, ph_dr0 = 0, ph_rp0 = 0;   // the pool's phase split when the decode rounds start
+        pool.phase_ms(ph_wp0, ph_dr0, ph_rp0);
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
@@ -5906,6 +5908,18 @@ int main(int argc, char** argv) {
                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
                         (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
                         (drive.cpu_ms - pool_ms0) / rounds);
+        // **WHERE THE POOL'S TIME GOES, INSIDE THE SPECULATIVE ROUND.**  `phase_ms` splits `run()` into the
+        // per-layer barrier (wait-park + re-park) and the WORK (drain); they need opposite fixes, so a single
+        // "pool ms/round" cannot decide between them.  Decode-only deltas: the counters are cumulative over the
+        // pool's lifetime and the prompt path runs the pool too.
+        if (rounds > 0) {
+            double wp = 0, dr = 0, rp = 0;
+            pool.phase_ms(wp, dr, rp);
+            std::printf("%-24s   wait-park %.3f  drain %.3f  re-park %.3f ms/round; round wall %.3f ms "
+                        "(%lld pool layers)\n",
+                        "pool phases", (wp - ph_wp0) / rounds, (dr - ph_dr0) / rounds, (rp - ph_rp0) / rounds,
+                        total_ms / rounds, (long long) rounds * g.n_layers);
+        }
         if (rounds > 0)
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
