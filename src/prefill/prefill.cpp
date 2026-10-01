@@ -111,8 +111,13 @@ inline int ring_slots(size_t T) {
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 
 inline bool is_mmq_gather_per_expert() {
+    // DEFAULT per-expert: the batched gather defers the device copy until the 16-expert group fills, holding raw
+    // blob pointers across streaming steps whose staging the stream path can recycle first - on long prompts
+    // (stream_all) this poisoned the hidden state intermittently and collapsed decode onto token 0 ("!"), while
+    // the per-expert path copies each blob immediately and is what upstream runs.  The batch measured neutral in
+    // time, so it stays available behind STRATA_MMQ_GATHER=batch until its lifetime is fixed.
     const char* v = std::getenv("STRATA_MMQ_GATHER");
-    return v != nullptr && std::strcmp(v, "per_expert") == 0;
+    return v == nullptr || std::strcmp(v, "batch") != 0;
 }
 
 // F-1: STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix), the A/B arm

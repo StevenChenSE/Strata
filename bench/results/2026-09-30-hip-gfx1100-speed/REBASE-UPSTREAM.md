@@ -678,3 +678,37 @@ sends experts down different arithmetic paths) interacting with specific long pr
 Practical mitigations: serve-layer detect-and-retry on N consecutive identical tokens; shorter prompts.  The root
 fix - placement-invariant expert numerics - is upstream engineering. A clean upstream repro exists: stock build,
 real code ~39K tokens via --tokens-file, two runs, one emits all zeros.
+
+## The all-token-0 ("!") decode collapse: root-caused to our batched expert gather, fixed engine-side
+
+The intermittent all-"!" output (every generated token = id 0, starting at token 1, usually in reasoning; ~50-80 %
+per request on ~39K-token real-code prompts) was chased to root cause by bisection across builds and files:
+
+1. NOT the kernels: the stock 0.1.30 binary is clean 7/7 on the same tokens (interleaved with our merged build
+   looping 8/17); our build with the WMMA envs removed still looped. (The earlier "stock also loops" observation
+   was the merged binary minus our kernels - the port's engine changes were still running.)
+2. NOT the serve layer (CLI reproduces), NOT any engine knob (pcie-frac, adapt-every, no-prefill-borrow,
+   ple-inflight, io threads, prefill chunk, kv-resident 0, sampling 0..1.0 all failed to eliminate it).
+3. Prefill-side: swapping our three prefill files (prefill.cpp, kernels.cu, moe_mmq.cu) to upstream's versions
+   made it 6/6 clean; the GDN dispatch is upstream-equivalent (pipe default routes to upstream's kernel), so the
+   suspect set reduced to the gather path.
+4. The runtime knob STRATA_MMQ_GATHER=per_expert (upstream's per-expert gather, everything else ours) ran 6/6
+   clean - isolating the bug to our port's batched expert gather (gather_native_batch, +80 lines in moe_mmq.cu,
+   only in this branch).
+
+Mechanism: the per-expert path copies each streamed expert blob to the GPU immediately and only then records the
+ring slot's used event; the batched path holds raw blob_dev pointers for up to 15 further streaming steps and
+copies the whole 16-expert group at once, so a streamed blob's staging can be recycled before the batch kernel
+reads it. The call site already forces per-expert when !stream_all && ring < MMQ_GROUP - the hazard was known -
+but not in the stream_all regime that long prompts run in. Wrong bytes for some experts poison the hidden state:
+draft and target then agree on token 0 forever (the smoking-gun stat: LOOP runs show drafts accepted 22/22
+(1.000) while clean runs sit at ~0.6), which is why no sampling setting escapes and why the collapse starts at
+the first generated token.
+
+Fix (prefill.cpp): the gather DEFAULTS to per-expert now; STRATA_MMQ_GATHER=batch re-enables the batched path
+for whoever repairs its lifetime.  The batch measured neutral in time when introduced, so the default flip costs
+nothing.
+
+Verification: new default 6/6 clean via CLI; negative control STRATA_MMQ_GATHER=batch still loops 2/3 (the bug
+remains reachable exactly through that path); the redeployed service ran the reproducing API request 6/6 clean
+(was 50-80 %) with coherent reasoning in every response.
