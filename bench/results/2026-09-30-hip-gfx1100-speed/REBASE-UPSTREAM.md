@@ -654,3 +654,27 @@ here - but the WMMA kernels still beat the calibrated table on this card, and th
 keeps WMMA primary. The table is now wired as the service's fallback (it only touches shapes WMMA declines:
 T < 16, K not a multiple of 16, other betas). It also settles the ordering question the reviewer raised: on this
 card, WMMA-ahead-of-table is the faster arrangement, not just the simpler one.
+
+### The intermittent all-token-0 ("!") output on long real prompts: engine-level, kernel-independent
+
+Investigated after the service emitted repeated "!" in reasoning_content under concurrent load. Findings, each
+verified by experiment:
+
+* Reproduces on **real code** (~39K tokens of genuine source), not just pathological prompts; rate ~50-80 % per
+  request at that size. Sampling does not escape it (temperature 0 / 0.6 / 0.6+top-k / 1.0 all loop).
+* **Not our kernels**: with the WMMA envs removed (stock 0.1.30 arithmetic) the identical request still loops
+  (1 of 2 on real code; 2 of 3 earlier). Our kernels: 4 of 5. CLI four-path comparison on a different prompt
+  (32k.txt ids) showed no loop and bit-identical tokens across stock/hipBLASLt/WMMA arms - that prompt just does
+  not trigger it.
+* **Not the serve layer**: feeding the SAME token ids through the engine CLI (--tokens-file) reproduces it
+  (one clean run, one all-zeros run) - the earlier "API-only" impression was an artifact of comparing different
+  prompt content per path.
+* **Not fixed by placement pinning**: --pcie-frac 0 still loops 3 of 4 via the API, and the CLI repro above looped
+  with --pcie-frac 0 AND --adapt-every 0. The run-to-run divergence survives those knobs.
+* Length threshold observed empirically: 4K diverse prompts never looped; ~15K and ~39K real content does.
+
+Conclusion: an engine-level numerical nondeterminism (the same family the port documents: different residency
+sends experts down different arithmetic paths) interacting with specific long prompts, present in stock 0.1.30.
+Practical mitigations: serve-layer detect-and-retry on N consecutive identical tokens; shorter prompts.  The root
+fix - placement-invariant expert numerics - is upstream engineering. A clean upstream repro exists: stock build,
+real code ~39K tokens via --tokens-file, two runs, one emits all zeros.
