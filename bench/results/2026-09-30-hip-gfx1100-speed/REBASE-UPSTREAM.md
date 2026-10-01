@@ -632,3 +632,25 @@ service startup dropped **995 s -> 93 s** (10.7x). The smaller warmup still page
 buffers and spins the thread pool; only the worst-case graph shape is deferred to the first big image, which is a
 CPU allocator cost, not the GPU-buffer concern the original warmup comment guards against (that rationale is
 CUDA-specific and this helper is CPU-only).
+
+### hipBLASLt tuning on this box: the shipped script works, the table engages, and WMMA still wins
+
+The repo ships `tools/hip/tune_hipblaslt` (built via `cmake --build build-hip --target tune_hipblaslt`). Ran it with
+the documented recipe (cases from the shipped 100200 table): a few minutes on the idle GPU, producing
+`tools/hip/gfx1100-hipblaslt-100401.txt` - a table matching this ROCm's hipBLASLt 1.4.1 (100401), which the shipped
+100100/100200 tables never did (the runtime guard rejected both). The engine log confirms the calibrated path
+engages with it.
+
+4K head-to-head (the documented measured config, two interleaved reps per arm; ranking consistent in both pairs):
+
+| arm | prefill (tok/s) | decode (tok/s) |
+| --- | ---: | ---: |
+| WMMA on (STRATA_WMMA_GEMM=1 + PA) | 1083.7 / 1308.4 | 32.1 / 41.3 |
+| calibrated table (WMMA off) | 852.2 / 1176.6 | 38.4 / 40.7 |
+| baseline (neither) | 658.6 / 552.8 | 37.3 / 37.3 |
+
+So the calibrated table is worth ~+55-90 % prefill over the hipblasGemmEx baseline - the documented lever is real
+here - but the WMMA kernels still beat the calibrated table on this card, and they dispatch first, so the service
+keeps WMMA primary. The table is now wired as the service's fallback (it only touches shapes WMMA declines:
+T < 16, K not a multiple of 16, other betas). It also settles the ordering question the reviewer raised: on this
+card, WMMA-ahead-of-table is the faster arrangement, not just the simpler one.
