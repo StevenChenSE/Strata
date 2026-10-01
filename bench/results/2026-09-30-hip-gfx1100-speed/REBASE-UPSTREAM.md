@@ -735,3 +735,21 @@ The decode A/B turned out to be a two-factor story:
 At the SERVICE's actual configuration (spec 2, adapt-every 2, pcie-frac 0.30, int8 KV, 32K prompt, 256 new), a
 head-to-head with upstream+patch: our branch pp 737 / tg 54.7 against upstream pp 651 / tg 36.8 - ahead on both,
 which is where the service now sits (intrinsics adopted, adapt-every already 2, spec 2).
+
+### Decode-path self-review + spec re-tuning (after the intrinsics adoption)
+
+Self-review of the decode path for remaining "same-class" wins:
+- The emulated-intrinsic class is now EXHAUSTED: all 52 packed-byte uses (__byte_perm/__vsub4/__vsubss4/__vcmpne4) native via
+  PR #322; __dp4a already native (__builtin_amdgcn_sudot4); __shfl_* are direct HIP pass-throughs. No remaining emulated
+  CUDA intrinsics in the decode kernels.
+- Remaining scalar patterns (iq2_* grid-sign loops) are table-lookup-bound, not instruction-bound - SWAR does not apply.
+- Profiled the tuned decode (spec-2 service config, 1K, 512 new, STRATA_VERIFY_PROFILE): wait for rings ~23.6 ms/round
+  dominates (~58%), pool tamed to ~8.5, dispatch ~7.4. A/B'd the stager ring (STRATA_STAGER_RING 16/64/256): flat - the
+  wait is the structural speculative-window cadence at spec 2, not ring starvation.
+
+Key finding - spec 4 now beats spec 2 at 32 K on today's build (previously spec 2 won, on the pre-intrinsics/pre-tune
+build). Interleaved 3x256 at 32 K: spec 2 = 54.5/56.5/54.3 (med 54.5), spec 3 = 59.4/55.6/53.3 (med 55.6), spec 4 =
+62.6/60.2/54.3 (med 60.2). Spec 4 = +10.5% over spec 2. Spec 1 is rejected for native IQ packs (needs T >= 2).
+
+Service updated: serve.json --spec 2 -> 4, restarted, verified via API (completion OK; metrics spec 6 / mtp_max 4,
+kv_resident 32768, images true). Short-prompt API decode 45.5 tok/s with 0.776 hit - within the normal range.
