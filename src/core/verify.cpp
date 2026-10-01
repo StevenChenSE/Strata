@@ -199,10 +199,8 @@ Verifier::~Verifier() {
     d_flag_ = d_flagA_ = d_flagB_ = nullptr;
     if (d_seq_) cudaFree(d_seq_);
     d_seq_ = nullptr;
-    if (d_pub_x_) cudaFree(d_pub_x_);
-    if (d_pub_ids_) cudaFree(d_pub_ids_);
-    if (d_pub_w_) cudaFree(d_pub_w_);
-    d_pub_x_ = d_pub_ids_ = d_pub_w_ = nullptr;
+    if (d_pub_pack_) cudaFree(d_pub_pack_);
+    d_pub_pack_ = d_pub_x_ = d_pub_ids_ = d_pub_w_ = nullptr;
     if (hip_dma_) { cudaStreamDestroy(hip_dma_); hip_dma_ = nullptr; }
     if (hip_wait_) { cudaStreamDestroy(hip_wait_); hip_wait_ = nullptr; }
 #endif
@@ -219,10 +217,22 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_,
+#ifdef STRATA_USE_HIP
+                     h_sent_,
+#endif
+                     h_ple_, h_out_, h_pub_pack_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+#ifdef STRATA_USE_HIP
+    h_sent_ = nullptr;
+    m_sent_ = nullptr;
+#endif
+    h_pub_pack_ = m_pub_pack_ = nullptr;
+    h_x_ = m_x_ = nullptr;
+    h_ids_ = m_ids_ = nullptr;
+    h_w_ = m_w_ = nullptr;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -287,21 +297,37 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
+    const size_t sz_x = (size_t) T * N * 4;
+    const size_t sz_ids = (size_t) T * K * 4;
+    const size_t sz_w = (size_t) T * K * 4;
+    auto align256 = [](size_t n) -> size_t { return (n + 255) & ~size_t(255); };
+    const size_t off_x = 0;
+    const size_t off_ids = align256(off_x + sz_x);
+    const size_t off_w = align256(off_ids + sz_ids);
+    pub_pack_bytes_ = align256(off_w + sz_w);
+
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
+#ifdef STRATA_USE_HIP
+              mapped(4, (void**) &h_sent_, (void**) &m_sent_) &&
+#endif
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
-              mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
-              mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
+              mapped(pub_pack_bytes_, (void**) &h_pub_pack_, (void**) &m_pub_pack_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    h_x_ = (float*) ((char*) h_pub_pack_ + off_x);
+    m_x_ = (float*) ((char*) m_pub_pack_ + off_x);
+    h_ids_ = (int32_t*) ((char*) h_pub_pack_ + off_ids);
+    m_ids_ = (int32_t*) ((char*) m_pub_pack_ + off_ids);
+    h_w_ = (float*) ((char*) h_pub_pack_ + off_w);
+    m_w_ = (float*) ((char*) m_pub_pack_ + off_w);
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -427,12 +453,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             return false;
         }
         cudaMemset(d_seq_, 0, 4);   // monotone across windows: never reset
-        if (cudaMalloc((void**) &d_pub_x_, (size_t) max_t * N * 4) != cudaSuccess ||
-            cudaMalloc((void**) &d_pub_ids_, (size_t) max_t * K * 4) != cudaSuccess ||
-            cudaMalloc((void**) &d_pub_w_, (size_t) max_t * K * 4) != cudaSuccess) {
+        if (cudaMalloc((void**) &d_pub_pack_, pub_pack_bytes_) != cudaSuccess) {
             err = "verify: the device payload allocation failed";
             return false;
         }
+        d_pub_x_ = (char*) d_pub_pack_ + off_x;
+        d_pub_ids_ = (char*) d_pub_pack_ + off_ids;
+        d_pub_w_ = (char*) d_pub_pack_ + off_w;
     }
 #endif
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
@@ -1178,6 +1205,20 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_at("verify window: waiting for the GPU to reach layer", l);
         const int timeout_s = [] { const char* e = std::getenv("STRATA_VERIFY_TIMEOUT_S"); return e ? std::atoi(e) : 20; }();
 #ifdef STRATA_USE_HIP
+        static const bool dma_spin = std::getenv("STRATA_DMA_SPIN") != nullptr;
+        auto on_timeout = [&] {
+            if (dma_spin) {
+                HIP_CK(hipMemcpy(h_commit_, d_seq_, 4, hipMemcpyDeviceToHost));
+            }
+            unsigned int obs[3] = {0, 0, 0};
+            strata::kernels::wait_flag_debug_obs(obs);
+            char db[160];
+            std::snprintf(db, sizeof db, " [d_seq=%u want=%u wait-ge: obs=%u val=%u spins64k=%u]",
+                          *(volatile const uint32_t*) h_commit_, base0 + want, obs[0], obs[1], obs[2]);
+            std::fprintf(stderr, "strata verify: timed out at layer %lld%s\n", (long long) l, db);
+            std::fflush(stderr);
+            std::_Exit(2);   // R3: skip destructors - the destructor syncs the spinning stream
+        };
         // one CP wait packet for the layer's ring (R4): no polling traffic, and the driver's wait
         // observes the GPU's own VRAM increment (device scope through L2).  Bounded so the host
         // can still diagnose and exit.
@@ -1187,30 +1228,39 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // not be queued behind the wait and must not have a pageable destination - a D2H copy to
         // pageable memory is synchronous at enqueue, so the writer deadlocked *inside* hipMemcpyAsync
         // here and the bounded loop below was never reached (observed by backtrace).
-        HIP_CK(hipMemcpyAsync(h_commit_, d_seq_, 4, hipMemcpyDeviceToHost, hip_dma_));
-        (void) spins; (void) last_flush;
-        while (true) {
-            const hipError_t q = hipStreamQuery(hip_wait_);
-            if (q == hipSuccess) break;
-            if (q != hipErrorNotReady) { HIP_CK(q); break; }
-            if (timeout_s > 0 && Clock::now() - a > std::chrono::seconds(timeout_s)) {
-                unsigned int obs[3] = {0, 0, 0};
-                strata::kernels::wait_flag_debug_obs(obs);
-                char db[160];
-                std::snprintf(db, sizeof db, " [d_seq=%u want=%u wait-ge: obs=%u val=%u spins64k=%u]",
-                              *(volatile const uint32_t*) h_commit_, base0 + want, obs[0], obs[1], obs[2]);
-                std::fprintf(stderr, "strata verify: timed out at layer %lld%s\n", (long long) l, db);
-                std::fflush(stderr);
-                std::_Exit(2);   // R3: skip destructors - the destructor syncs the spinning stream
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (!dma_spin) {
+            HIP_CK(hipMemcpyAsync(h_commit_, d_seq_, 4, hipMemcpyDeviceToHost, hip_dma_));
         }
-        // The doorbell was observed: only now pull the payload (x/ids/w) back through the copy engine,
-        // so nothing sits behind the wait packet and the pool still reads it after the handshake.
-        HIP_CK(hipMemcpyAsync(h_x_, d_pub_x_, (size_t) max_t_ * g.n_embd * 4, hipMemcpyDeviceToHost, hip_wait_));
-        HIP_CK(hipMemcpyAsync(h_ids_, d_pub_ids_, (size_t) max_t_ * ss.k * 4, hipMemcpyDeviceToHost, hip_wait_));
-        HIP_CK(hipMemcpyAsync(h_w_, d_pub_w_, (size_t) max_t_ * ss.k * 4, hipMemcpyDeviceToHost, hip_wait_));
-        HIP_CK(hipStreamSynchronize(hip_wait_));
+        (void) spins; (void) last_flush;
+        if (dma_spin) {
+            HIP_CK(hipMemcpyAsync(h_pub_pack_, d_pub_pack_, pub_pack_bytes_, hipMemcpyDeviceToHost, hip_wait_));
+            HIP_CK(hipMemcpyAsync(h_sent_, d_seq_, 4, hipMemcpyDeviceToHost, hip_wait_));
+            uint64_t iters = 0;
+            while (*(volatile const uint32_t*) h_sent_ < base0 + want) {
+                _mm_pause();
+                if ((++iters & 0xFFFFu) == 0u) {
+                    const hipError_t q = hipStreamQuery(hip_wait_);
+                    if (q != hipSuccess && q != hipErrorNotReady) { HIP_CK(q); break; }
+                    if (timeout_s > 0 && Clock::now() - a > std::chrono::seconds(timeout_s)) {
+                        on_timeout();
+                    }
+                }
+            }
+        } else {
+            while (true) {
+                const hipError_t q = hipStreamQuery(hip_wait_);
+                if (q == hipSuccess) break;
+                if (q != hipErrorNotReady) { HIP_CK(q); break; }
+                if (timeout_s > 0 && Clock::now() - a > std::chrono::seconds(timeout_s)) {
+                    on_timeout();
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            // The doorbell was observed: only now pull the payload (x/ids/w) back through the copy engine,
+            // so nothing sits behind the wait packet and the pool still reads it after the handshake.
+            HIP_CK(hipMemcpyAsync(h_pub_pack_, d_pub_pack_, pub_pack_bytes_, hipMemcpyDeviceToHost, hip_wait_));
+            HIP_CK(hipStreamSynchronize(hip_wait_));
+        }
 #else
         volatile uint32_t* const seq = h_seq_;   // CUDA path: the host-mapped doorbell the GPU increments
         while (*seq < want) {

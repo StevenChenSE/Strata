@@ -184,6 +184,7 @@ private:
     cudaStream_t hip_wait_ = nullptr;
     void* d_seq_ = nullptr;                               // HIP: monotone ring counter in VRAM
     unsigned seq_base_ = 0;                               // host-side base for the current window
+    void* d_pub_pack_ = nullptr;                          // HIP: packed payload [x | ids | w]
     void* d_pub_x_ = nullptr; void* d_pub_ids_ = nullptr; void* d_pub_w_ = nullptr;
     // HIP: the doorbell kernel's payload (x/ids/w) lands in VRAM - shader stores to mapped host
     // memory have no writeback guarantee on RDNA3, so the host D2H-copies the payload instead of
@@ -211,8 +212,11 @@ private:
     int32_t* h_step_ = nullptr;  int32_t* m_step_ = nullptr;    // T * kStepCount
     int32_t* h_pos_ = nullptr;   int32_t* m_pos_ = nullptr;     // T * n_head
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
+    uint32_t* h_sent_ = nullptr; uint32_t* m_sent_ = nullptr;   // 4-byte DMA spin sentinel
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
+    void* h_pub_pack_ = nullptr; void* m_pub_pack_ = nullptr;   // packed doorbell payload: [x | ids | w]
+    size_t pub_pack_bytes_ = 0;
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
