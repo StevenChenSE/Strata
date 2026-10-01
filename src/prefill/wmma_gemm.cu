@@ -41,7 +41,11 @@ template <>
 struct WmmaTraits<_Float16> {
     using vec_t = _Float16 __attribute__((ext_vector_type(16)));
     __device__ static inline v8fp32 mma(vec_t a, vec_t b, v8fp32 c) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+        (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
+#endif
     }
 };
 
@@ -49,7 +53,11 @@ template <>
 struct WmmaTraits<__bf16> {
     using vec_t = __bf16 __attribute__((ext_vector_type(16)));
     __device__ static inline v8fp32 mma(vec_t a, vec_t b, v8fp32 c) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
         return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+#else
+        (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
+#endif
     }
 };
 

@@ -22,8 +22,13 @@
 #                        is not validated here - see bench/results/2026-09-27-kv-q4 and the G-C gate note.
 #   --max-context 262144 the model's own context (GGUF: qwen4exp.context_length = 262144).  Verified to start
 #                        at 32K/64K/128K/256K; 8x the context costs ~6 GiB of expert cache at fp16 KV.
-#   --spec 2             the draft length that wins at >=32K context (55.6 vs 52.1 for spec 4).  At short
-#                        context the optimum is 4 (47.1 vs 42.1), so override with SPEC=4 for short work.
+#   --spec 4             the draft length that now wins at >=32K context on this build (60.2 vs 54.5 for
+#                        spec 2 - re-measured after the intrinsics + residency tuning; the wider window
+#                        amortises the structural per-round verify wait).  SPEC=2 is a fallback for short/small.
+#
+#   STRATA_WMMA_GEMM / STRATA_PA_WMMA are OPT-IN switches on this branch (review agreement with upstream): the
+#   WMMA dense GEMMs and prompt attention run only when set to 1.  This launcher enables both by default via
+#   WMMA=1 and PA=1; set WMMA=0 and/or PA=0 to disable (values are parsed, so bare "0" turns them off).
 #   --pcie-frac 0.30     the measured optimum on the merged engine at 32K: pp 1136.6 and tg 57.6 against
 #                        1104.9 and 52.4 with 0 (see the note above), and +10% decode at 1K versus the 0.55
 #                        default on the pre-merge engine.
@@ -36,7 +41,7 @@
 #   DRY_RUN=1 tools/run-tuned.sh --tokens 9707            # print the command without running it
 #
 # Overridable via the environment: GPU CTX KV SPEC PREFILL PCIE_FRAC CACHE MAXNEW TIMEOUT_S
-# KV_RESIDENT TIMING DATA BIN OUT.
+# KV_RESIDENT TIMING DATA BIN OUT WMMA PA.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,7 +52,7 @@ OUT="${OUT:-/tmp/strata-run.log}"
 GPU="${GPU:-0}"
 CTX="${CTX:-262144}"
 KV="${KV:-int8}"
-SPEC="${SPEC:-2}"
+SPEC="${SPEC:-4}"
 PREFILL="${PREFILL:-2048}"
 PCIE_FRAC="${PCIE_FRAC:-0.30}"
 CACHE="${CACHE:-auto}"
@@ -107,6 +112,8 @@ done
 
 cmd=(env "HIP_VISIBLE_DEVICES=$GPU")
 [[ "$TIMING" == "1" ]] && cmd+=(STRATA_PREFILL_TIMING=1)
+[[ "${WMMA:-1}" == "1" ]] && cmd+=(STRATA_WMMA_GEMM=1)
+[[ "${PA:-1}" == "1" ]] && cmd+=(STRATA_PA_WMMA=1)
 cmd+=("$BIN"
   --pack "$PACK" --native "$NATIVE" --ple-gguf "$PLE"
   --expert-profile "$PROFILE" --expert-cache "$CACHE" --prefill "$PREFILL"

@@ -537,9 +537,13 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                     } else {
                         __builtin_memcpy(&b, &S.k[cb + lane_lo][k0], sizeof(vec16_f16));
                     }
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
                     tg = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, b, tg);
+#endif
 #ifndef D1_NO_QLO
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
                     tg = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(al, b, tg);
+#endif
 #endif
                 }
                 const int c = cb + lane_lo;
@@ -640,9 +644,13 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                         }
                         __builtin_memcpy(&b, b_arr, sizeof(vec16_f16));
                     }
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
                     tmp[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, b, tmp[j]);
+#endif
 #ifndef D1_NO_PLO
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
                     tmp[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(al, b, tmp[j]);
+#endif
 #endif
                 }
             }

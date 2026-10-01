@@ -350,8 +350,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     // STRATA_WMMA_BF16=0 exists so the bf16 increment can be measured separately from the fp16 one.  The arch
     // macro that gates the implementation comes from the build (see wmma_gemm.cu); if it is absent the call
     // returns false and this falls through, so a non-gfx11 build cannot silently run empty stubs.
-    static const bool wmma_on = std::getenv("STRATA_WMMA_GEMM") != nullptr;   // opt-in (review: run after, not before, hipBLASLt by default)
-    static const bool bf16_on = std::getenv("STRATA_WMMA_BF16") == nullptr;   // opt-out within the opt-in (A/B granularity)
+    // opt-in (review: run after, not before, hipBLASLt by default).  Values are parsed, not presence-tested:
+    // STRATA_WMMA_GEMM=0 and STRATA_WMMA_BF16=0 both disable, "1" (or any non-zero value) enables.
+    static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
+    static const bool bf16_on = [] { const char* v = std::getenv("STRATA_WMMA_BF16"); return !v || (v[0] != 0 && v[0] != '0'); }();
     if (wmma_on && bf16_on && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_bf16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
@@ -379,7 +381,8 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     // STRATA_WMMA_GEMM=0 is the A/B arm: force the hipblasGemmEx path even where WMMA would be used.  The
     // arch macro that gates the implementation comes from the build (see wmma_gemm.cu); if it is absent the
     // call returns false and this falls through, so a non-gfx11 build cannot silently run empty stubs.
-    static const bool wmma_on = std::getenv("STRATA_WMMA_GEMM") != nullptr;   // opt-in (review: run after, not before, hipBLASLt by default)
+    // opt-in: parsed, so STRATA_WMMA_GEMM=0 disables (review: run after, not before, hipBLASLt by default)
+    static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
     if (wmma_on && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
