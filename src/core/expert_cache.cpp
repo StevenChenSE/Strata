@@ -182,8 +182,8 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         return false;
     }
 #endif
-    // same per-layer ranges as open(): resetting to 0 makes EVERY layer's first experts collide in
-    // slots 0.. and the profile verify reads a slot that a later layer overwrote.
+    // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
+    // "slots", so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;
