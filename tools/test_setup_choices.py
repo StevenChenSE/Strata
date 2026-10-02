@@ -166,9 +166,14 @@ class HipVision(unittest.TestCase):
         for asked in (None, "no", "none"):
             self.assertEqual(quiet(setup.hip_vision, asked), ("none", ""))
         for asked in ("yes", "gpu"):
+            self.assertEqual(quiet(setup.hip_vision, asked), ("gpu", ""))
+
+    @mock.patch.object(setup, "WIN", True)
+    def test_the_choice_on_windows(self):
+        for asked in ("yes", "gpu", "cpu"):
             got, out = quiet(setup.hip_vision, asked)
             self.assertEqual(got, "none")
-            self.assertIn("--vision cpu", out)
+            self.assertIn("images off", out)
 
     def build(self, meta, vision, vexe=False):
         """build_engine_hip with an engine that is already built: only the encoder can be missing."""
@@ -189,6 +194,7 @@ class HipVision(unittest.TestCase):
                 (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
 
             with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
+                    mock.patch.object(setup, "rocm_root", lambda archs: (Path("/rocm"), ["/rocm/lib"])), \
                     mock.patch.object(setup, "source_hash", lambda paths: vsrc if paths == setup.VISION_SOURCES else src):
                 quiet(setup.build_engine_hip, {"arch": "gfx1201"}, "llama", vision)
             return built, json.loads((eng / "BUILD.json").read_text()), (eng / setup.VEXE).exists()
@@ -197,11 +203,27 @@ class HipVision(unittest.TestCase):
         built, meta, have = self.build({}, "cpu")
         self.assertEqual([t for t, _ in built], ["strata-vision"])
         self.assertIn("-DSTRATA_VISION_CUDA=OFF", built[0][1])
+        self.assertNotIn("-DSTRATA_VISION_HIP=ON", built[0][1])
         self.assertEqual((meta["vision"], meta["vision_src"], have), ("cpu", "V", True))
         built, meta, _ = self.build({"vision": "cpu", "vision_src": "V"}, "cpu", vexe=True)
         self.assertEqual(built, [])                                    # built and unchanged: nothing to do
         built, meta, _ = self.build({"vision": "cpu", "vision_src": "old"}, "cpu", vexe=True)
         self.assertEqual([t for t, _ in built], ["strata-vision"])     # its source changed: again
+
+    def test_the_gpu_encoder_is_built_once(self):
+        built, meta, have = self.build({}, "gpu")
+        self.assertEqual([t for t, _ in built], ["strata-vision"])
+        self.assertIn("-DSTRATA_VISION_HIP=ON", built[0][1])
+        self.assertIn("-DSTRATA_VISION_CUDA=OFF", built[0][1])
+        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1201", built[0][1])
+        self.assertEqual((meta["vision"], meta["vision_src"], meta["vision_archs"], have),
+                         ("gpu", "V", ["gfx1201"], True))
+        built, meta, _ = self.build({"vision": "gpu", "vision_src": "V", "vision_archs": ["gfx1201"]}, "gpu", vexe=True)
+        self.assertEqual(built, [])                                    # built and unchanged: nothing to do
+        built, meta, _ = self.build({"vision": "cpu", "vision_src": "V"}, "gpu", vexe=True)
+        self.assertEqual([t for t, _ in built], ["strata-vision"])     # a cpu encoder on the gpu path: rebuilt
+        built, meta, _ = self.build({"vision": "gpu", "vision_src": "V", "vision_archs": ["gfx1101"]}, "gpu", vexe=True)
+        self.assertEqual([t for t, _ in built], ["strata-vision"])     # no code for this card: rebuilt
 
     def test_without_images_nothing_changes(self):
         built, meta, have = self.build({}, "none")

@@ -1416,8 +1416,9 @@ def hipblaslt_table(arch, lib_dirs, ver=None):
 
 def build_engine_hip(gpu, llama, vision="none") -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
-    gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
-    (#304): the image encoder too, for the CPU (there is no HIP encoder build yet)."""
+    gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision
+    "cpu" (#304): the image encoder on the CPU; vision "gpu" (EVAL-hip-vision.md): the same encoder with ggml-hip,
+    on the card."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -1426,12 +1427,15 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
     has_archs = set(archs) <= set(meta.get("archs", []))
     engine_ok = meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and has_archs
-    vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc)
+    vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc
+                                     and meta.get("vision") == vision
+                                     and (vision != "gpu" or set(archs) <= set(meta.get("vision_archs", []))))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
     if engine_ok:
-        return build_vision_cpu(eng, stamp, meta, llama, vsrc)
+        return build_vision_hip(eng, stamp, meta, llama, vsrc, archs) if vision == "gpu" \
+            else build_vision_cpu(eng, stamp, meta, llama, vsrc)
     if not (shutil.which("c++") or shutil.which("g++")) or not shutil.which("git"):
         fail("a C++ compiler and git are needed to compile the AMD engine",
              "Ubuntu/Debian: sudo apt install build-essential git   Fedora: sudo dnf install gcc-c++ git")
@@ -1458,23 +1462,50 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
             "lib_dirs": dirs, "src": src}
     if vision != "none":
-        return build_vision_cpu(eng, stamp, meta, llama, vsrc)
+        return build_vision_hip(eng, stamp, meta, llama, vsrc, archs) if vision == "gpu" \
+            else build_vision_cpu(eng, stamp, meta, llama, vsrc)
     stamp.write_text(json.dumps(meta, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
 
 def hip_vision(asked) -> str:
-    """The image encoder with the AMD backend (--vision): the CPU one when asked for (#304); a HIP (GPU) encoder build
-    is a later step, so `yes`/`gpu` leave images off, as before, and say how to get them."""
+    """The image encoder with the AMD backend (--vision): "gpu" builds it for the AMD GPU (ggml-hip, the same mtmd
+    graph the CPU one runs; measured on an RX 7900 XTX: 60-235 ms a picture vs 26-37 s on the CPU, about 1.3 GB of
+    VRAM, .rocm-eval/EVAL-hip-vision.md); "cpu" keeps it on the CPU (#304).  Windows' ready-made AMD engine has no
+    encoder."""
     if asked in ("yes", "gpu"):
-        warn("the AMD backend has no GPU image encoder yet: images off"
-             + ("" if WIN else " (--vision cpu reads them on the CPU)"))
+        if WIN:
+            warn("the ready-made Windows AMD engine has no image encoder: images off")
+            return "none"
+        return "gpu"
     if asked == "cpu" and WIN:
         warn("images on the CPU with an AMD card are Linux-only for now (the ready-made Windows AMD engine has no "
              "image encoder): images off")
         return "none"
     return "cpu" if asked == "cpu" else "none"
+
+
+def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs) -> Path:
+    """The image encoder on the AMD GPU (tools/vision with ggml-hip instead of ggml-cuda).  Needs the ROCm toolchain
+    the engine was built with: about 190 HIP source files, a few minutes, once."""
+    root, dirs = rocm_root(archs)
+    os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr", "ROCM_PATH": str(root),
+                       "HIP_PATH": str(root)})
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+    if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc and meta.get("vision") == "gpu"
+            and set(archs) <= set(meta.get("vision_archs", []))):
+        say("  Compiling the image encoder for the AMD GPU (a few minutes, once) ...")
+        cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
+                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_CUDA=OFF",
+                     "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+                     "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *[str(Path(d).parent) for d in dirs[1:]]])],
+                    None, "")
+        shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
+    stamp.write_text(json.dumps({**meta, "vision": "gpu", "vision_src": vsrc, "vision_archs": archs}, indent=1))
+    ok(f"engine: {eng / EXE}, image encoder (AMD GPU): {eng / VEXE}")
+    return eng
 
 
 def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:

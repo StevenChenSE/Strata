@@ -3,12 +3,14 @@
 #
 #   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
 #         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]
+#         [-DSTRATA_VISION_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1100]   (AMD, EVAL-hip-vision.md)
 #   cmake --build build-vision --target strata-vision
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
 option(STRATA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
+option(STRATA_VISION_HIP "run the vision encoder on an AMD GPU (builds ggml-hip)" OFF)
 option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
 if(STRATA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
@@ -35,6 +37,16 @@ else()
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
+set(GGML_HIP ${STRATA_VISION_HIP} CACHE BOOL "" FORCE)
+if(STRATA_VISION_HIP)
+  if(STRATA_VISION_CUDA)
+    message(FATAL_ERROR "STRATA_VISION_HIP and STRATA_VISION_CUDA are exclusive: one GPU backend per encoder")
+  endif()
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
+    set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "HIP target, e.g. gfx1100 or gfx1100;gfx1201")
+  endif()
+  enable_language(HIP)                           # ggml-hip's own list needs the language on before add_subdirectory
+endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 

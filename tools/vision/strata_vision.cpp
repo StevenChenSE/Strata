@@ -77,12 +77,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     // On the CPU the GPU stays unseen: a CUDA build otherwise opens a context there (measured: 0.4-0.7 GB of VRAM,
-    // 150-260 expert slots less for the engine beside it).  Before anything reaches the CUDA runtime.
+    // 150-260 expert slots less for the engine beside it).  Before anything reaches the CUDA/HIP runtime.  HIP reads
+    // HIP_VISIBLE_DEVICES and ignores the CUDA name, so both are set (EVAL-hip-vision.md).
     if (!gpu) {
 #ifdef _WIN32
         _putenv_s("CUDA_VISIBLE_DEVICES", "-1");
+        _putenv_s("HIP_VISIBLE_DEVICES", "-1");
 #else
         setenv("CUDA_VISIBLE_DEVICES", "-1", 1);
+        setenv("HIP_VISIBLE_DEVICES", "-1", 1);
 #endif
     }
     llama_log_set(quiet_log, nullptr);
