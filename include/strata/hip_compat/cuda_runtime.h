@@ -1,6 +1,15 @@
 #pragma once
 // Included only by STRATA_ENABLE_HIP builds. CUDA builds use NVIDIA headers.
 #define STRATA_USE_HIP 1
+#if defined(_WIN32)
+// hip_runtime.h pulls in <windows.h> on Windows: keep its min/max macros and the rarely used APIs out of the engine.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
 #include <hip/hip_runtime.h>
 // CUDA's <math_constants.h> provides CUDART_INF_F, which CUDA-shaped sources use; HIP spells it HIP_INF_F.  This
 // header is force-included into every translation unit, so mapping it here makes the constant available without
